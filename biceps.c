@@ -7,21 +7,41 @@
 #include <signal.h>
 #include <string.h>
 
+#define NBMAXC 10
+
 char *buildPrompt(void);
 void intHandler(int s);
 int analyseCom(char *b);
 char *copyString(char *s);
 void freeWords(void);
+void addCom(char *name, int (*f)(int, char **));
+void updateComInt(void);
+void listComInt(void);
+int execComInt(int argc, char **argv);
+
+/* Internal Commands */
+int Help(int argc, char **argv);
+int Exit(int argc, char **argv);
 
 static char **words;
 static int nWords;
 
-int main(int argc, char *argv[]){
+typedef struct{
+    char *name;
+    int (*f)(int, char **);
+} comInt;
+
+static comInt tabCom[NBMAXC];
+static int nCom = 0;
+
+int main(int argc, char *argv[]){    
     char *prompt;
     char *line;
-    int i;
-
+    
     signal(SIGINT, intHandler);
+
+    updateComInt();
+    listComInt();
 
     prompt = buildPrompt();
 
@@ -37,12 +57,8 @@ int main(int argc, char *argv[]){
             add_history(line);
 
             if(analyseCom(line) > 0){
-                printf("Command: %s\n", words[0]);
-                if(nWords > 1){
-                    printf("Arguments:\n");
-                    for(i=1; i<nWords; i++){
-                        printf("  %s\n", words[i]);
-                    }
+                if(!execComInt(nWords, words)){
+
                 }
                 freeWords();
             }            
@@ -142,4 +158,52 @@ void freeWords(void){
     free(words);
     nWords = 0;
     words = NULL;
+}
+
+void addCom(char *name, int (*f)(int, char **)){
+    if(nCom >= NBMAXC){
+        fprintf(stderr, "Error: Maximum number of commands reached (NBMAXC = %d).\n", NBMAXC);
+        exit(EXIT_FAILURE);
+    }
+    tabCom[nCom].name = name;
+    tabCom[nCom].f = f;
+    nCom++;
+}
+
+
+void updateComInt(void){
+    addCom("exit", Exit);
+    addCom("help", Help);
+}
+
+void listComInt(void){
+    int i;
+    printf("Internal Commands (%d):\n", nCom);
+    for(i=0; i<nCom; i++){
+        printf("  %s\n", tabCom[i].name);
+    }
+}
+
+int execComInt(int argc, char **argv){
+    int i;
+    for(i=0; i<nCom; i++){
+        if(strcmp(argv[0], tabCom[i].name) == 0){
+            tabCom[i].f(argc, argv);
+            return 1;
+        }
+    }
+    return 0;
+}
+
+int Exit(int argc, char **argv){
+    (void)argc;
+    (void)argv;
+    exit(0);
+}
+
+int Help(int argc, char **argv){
+    (void)argc;
+    (void)argv;
+    listComInt();
+    return 0;
 }
