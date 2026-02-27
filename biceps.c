@@ -1,11 +1,12 @@
 #define _GNU_SOURCE
-#include <stdio.h>
-#include <readline/readline.h>
-#include <readline/history.h>
-#include <stdlib.h>
-#include <unistd.h>
-#include <signal.h>
-#include <string.h>
+#include<stdio.h>
+#include<readline/readline.h>
+#include<readline/history.h>
+#include<stdlib.h>
+#include<unistd.h>
+#include<signal.h>
+#include<string.h>
+#include<sys/wait.h>
 
 #define NBMAXC 10
 
@@ -18,6 +19,7 @@ void addCom(char *name, int (*f)(int, char **));
 void updateComInt(void);
 void listComInt(void);
 int execComInt(int argc, char **argv);
+int execComExt(char **argv);
 
 /* Internal Commands */
 int Help(int argc, char **argv);
@@ -37,7 +39,7 @@ static int nCom = 0;
 int main(int argc, char *argv[]){    
     char *prompt;
     char *line;
-    
+
     signal(SIGINT, intHandler);
 
     updateComInt();
@@ -58,7 +60,7 @@ int main(int argc, char *argv[]){
 
             if(analyseCom(line) > 0){
                 if(!execComInt(nWords, words)){
-
+                    execComExt(words);
                 }
                 freeWords();
             }            
@@ -118,7 +120,7 @@ int analyseCom(char *b){
     while((token = strsep(&aux, sep)) != NULL){
         if(*token == '\0') continue;
         
-        words = realloc(words, (nWords + 1)*sizeof(char*));
+        words = realloc(words, (nWords + 2)*sizeof(char*));
 
         if(words == NULL){
             perror("Error reallocating memory for words array");
@@ -128,6 +130,10 @@ int analyseCom(char *b){
         words[nWords++] = copyString(token);
     }
 
+    if(words != NULL){
+        words[nWords] = NULL; //NULL for execvp
+    }
+    
     free(copy);
     return nWords;          
 }
@@ -193,6 +199,35 @@ int execComInt(int argc, char **argv){
         }
     }
     return 0;
+}
+
+int execComExt(char **argv){
+    pid_t pid;
+    int status;
+
+    pid = fork();
+
+    if (pid < 0){
+        perror("Error forking process");
+        return -1;
+    }else if(pid == 0){ //Child process
+        #ifdef TRACE
+            printf("[TRACE] child pid=%d executing: %s\n", getpid(), argv[0]);
+        #endif
+        execvp(argv[0], argv);
+        fprintf(stderr, "%s: command not found\n", argv[0]);
+        exit(EXIT_FAILURE);
+    }
+
+    //Parent process
+    #ifdef TRACE
+        printf("[TRACE] parent pid=%d waiting for child pid=%d\n", getpid(), pid);
+    #endif
+    waitpid(pid, &status, 0);
+    #ifdef TRACE
+        printf("[TRACE] child exited with status %d\n", WEXITSTATUS(status));
+    #endif
+    return WEXITSTATUS(status);
 }
 
 int Exit(int argc, char **argv){
