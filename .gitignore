@@ -1,0 +1,8 @@
+biceps
+triceps
+biceps-debug
+
+*.o
+vgcore.*
+
+*.pdf
