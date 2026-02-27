@@ -7,6 +7,53 @@
 #include <signal.h>
 #include <string.h>
 
+char *buildPrompt(void);
+void intHandler(int s);
+int analyseCom(char *b);
+char *copyString(char *s);
+void freeWords(void);
+
+static char **words;
+static int nWords;
+
+int main(int argc, char *argv[]){
+    char *prompt;
+    char *line;
+
+    signal(SIGINT, intHandler);
+
+    prompt = buildPrompt();
+
+    while(1){
+        line = readline(prompt);
+
+        if(line == NULL){
+            printf("\n");
+            break;
+        }
+
+        if(*line != '\0'){
+            add_history(line);
+
+            if(analyseCom(line) > 0){
+                printf("Command: %s\n", words[0]);
+                if(nWords > 1){
+                    printf("Arguments:\n");
+                    int i;
+                    for(i=1; i<nWords; i++){
+                        printf("  %s\n", words[i]);
+                    }
+                }
+                freeWords();
+            }            
+        }
+        free(line);
+    }
+
+    free(prompt);
+    return 0;
+}
+
 char *buildPrompt(void){
     char *user;
     char machine[256];
@@ -44,30 +91,55 @@ void intHandler(int s){
     exit(0);
 }
 
-int main(int argc, char *argv[]){
-    char *prompt;
-    char *line;
+int analyseCom(char *b){
+    char *copy, *token, *aux, *sep = " \t\n";
 
-    signal(SIGINT, intHandler);
+    nWords = 0;
+    words = NULL;
+    copy = copyString(b);
+    aux = copy;
 
-    prompt = buildPrompt();
+    while((token = strsep(&aux, sep)) != NULL){
+        if(*token == '\0') continue;
+        
+        words = realloc(words, (nWords + 1)*sizeof(char*));
 
-    while(1){
-        line = readline(prompt);
-
-        if(line == NULL){
-            printf("\n");
-            break;
+        if(words == NULL){
+            perror("Error reallocating memory for words array");
+            free(copy);
+            exit(EXIT_FAILURE);
         }
-
-        if(*line != '\0'){
-            add_history(line);
-        }
-        printf("Command entered: %s\n", line);
-
-        free(line);
+        words[nWords++] = copyString(token);
     }
 
-    free(prompt);
-    return 0;
+    free(copy);
+    return nWords;          
+}
+
+char *copyString(char *s){
+    char *copy;
+    int len = strlen(s) + 1;
+
+    copy = malloc(len);
+    if(copy == NULL){
+        perror("Error allocating memory for string copying");
+        exit(EXIT_FAILURE);
+    }
+
+    int i;
+    for(i=0; i<len; i++){
+        copy[i] = s[i];
+    }  
+
+    return copy;
+}
+
+void freeWords(void){
+    int i;
+    for(i=0; i<nWords; i++){
+        free(words[i]);
+    }
+    free(words);
+    nWords = 0;
+    words = NULL;
 }
