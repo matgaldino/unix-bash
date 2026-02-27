@@ -19,6 +19,7 @@ static int nWords;
 int main(int argc, char *argv[]){
     char *prompt;
     char *line;
+    int i;
 
     signal(SIGINT, intHandler);
 
@@ -39,7 +40,6 @@ int main(int argc, char *argv[]){
                 printf("Command: %s\n", words[0]);
                 if(nWords > 1){
                     printf("Arguments:\n");
-                    int i;
                     for(i=1; i<nWords; i++){
                         printf("  %s\n", words[i]);
                     }
