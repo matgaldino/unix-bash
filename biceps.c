@@ -10,6 +10,8 @@
 
 #define VERSION "1.00"
 #define NBMAXC 10
+#define HISTORY_FILE ".biceps_history"
+#define HISTORY_SIZE 100
 
 char *buildPrompt(void);
 void intHandler(int s);
@@ -22,6 +24,7 @@ void listComInt(void);
 int execComInt(int argc, char **argv);
 int execComExt(char **argv);
 void execLine(char *line);
+char *getHistoryPath(void);
 
 /* Internal Commands */
 int Help(int argc, char **argv);
@@ -42,13 +45,18 @@ static comInt tabCom[NBMAXC];
 static int nCom = 0;
 
 int main(int argc, char *argv[]){    
-    char *prompt;
-    char *line;
+    char *prompt, *line, *historyPath;
+    HIST_ENTRY *last;
+
 
     signal(SIGINT, intHandler);
 
     updateComInt();
     listComInt();
+
+    historyPath = getHistoryPath();
+    stifle_history(HISTORY_SIZE);
+    read_history(historyPath);
 
     prompt = buildPrompt();
 
@@ -56,16 +64,22 @@ int main(int argc, char *argv[]){
         line = readline(prompt);
 
         if(line == NULL){
-            printf("\n");
+            printf("Exiting biceps shell. Goodbye!\n");
             break;
         }
 
         if(*line != '\0'){
-            add_history(line);
+            last = history_length > 0 ? history_get(history_base + history_length - 1) : NULL;
+            if(last == NULL || strcmp(last->line, line) != 0){
+                add_history(line);
+            }
             execLine(line);
         }
         free(line);
     }
+
+    write_history(historyPath);
+    free(historyPath);
 
     free(prompt);
     return 0;
@@ -105,7 +119,9 @@ char *buildPrompt(void){
 
 void intHandler(int s){
     (void)s;
-    exit(0);
+    printf("\n");
+    rl_on_new_line();
+    rl_redisplay();
 }
 
 int analyseCom(char *b){
@@ -253,9 +269,39 @@ void execLine(char *line){
     free(copy);
 }
 
+char *getHistoryPath(void){
+    char *home, *path;
+    int len;
+
+    home = getenv("HOME");
+    if(home == NULL){
+        fprintf(stderr, "Error: HOME environment variable not set.\n");
+        exit(EXIT_FAILURE);
+    }
+
+    //home + '/' + HISTORY_FILE + '\0'
+    len = strlen(home) + 1 + strlen(HISTORY_FILE) + 1;
+    path = malloc(len);
+    if(path == NULL){
+        perror("Error allocating memory for history path");
+        exit(EXIT_FAILURE);
+    }
+
+    snprintf(path, len, "%s/%s", home, HISTORY_FILE);
+
+    return path;
+}
+
 int Exit(int argc, char **argv){
+    char *historyPath;
+    
     (void)argc;
     (void)argv;
+
+    historyPath = getHistoryPath();
+    write_history(historyPath);
+    free(historyPath);
+    printf("Exiting biceps shell. Goodbye!\n");
     exit(0);
 }
 
