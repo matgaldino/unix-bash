@@ -8,7 +8,7 @@
 #include "gescom.h"
 
 #define GESCOM_VERSION "1.00"
-static char *shell_version = "unkown";
+static char *shell_version = "unknown";
 
 static char **words;
 static int nWords;
@@ -21,6 +21,8 @@ static void freeWords(void);
 static void addCom(char *name, int (*f)(int, char **));
 static int execComInt(int argc, char **argv);
 static int execComExt(char **argv);
+static void execPipe(char *line);
+
 static int Exit(int argc, char **argv);
 static int Help(int argc, char **argv);
 static int Cd(int argc, char **argv);
@@ -157,6 +159,10 @@ void execLine(char *line){
     char *copy, *cmd, *aux;
 
     copy = strdup(line); //4.4 remplace copyString par strdup()
+    if(copy == NULL){
+        perror("Error duplicating line for command execution");
+        exit(EXIT_FAILURE);
+    }
     aux = copy;
 
     while((cmd = strsep(&aux, ";")) != NULL){
@@ -164,11 +170,15 @@ void execLine(char *line){
             printf("[TRACE] execLine: sub-command: '%s'\n", cmd);
         #endif
 
-        if(analyseCom(cmd) > 0){
-            if(!execComInt(nWords, words)){
-                execComExt(words);
+        if(strchr(cmd, '|') != NULL){
+            execPipe(cmd);
+        }else{
+            if(analyseCom(cmd) > 0){
+                if(!execComInt(nWords, words)){
+                    execComExt(words);
+                }
+                freeWords();
             }
-            freeWords();
         }
     }
     free(copy);
@@ -195,6 +205,119 @@ char *getHistoryPath(void){
     snprintf(path, len, "%s/%s", home, HISTORY_FILE);
 
     return path;
+}
+
+static void execPipe(char *line){
+    char *commands[NBMAXC];
+    int nCommands = 0, i;
+    char *copy, *cmd, *aux;
+    int pipes[NBMAXC][2];
+    pid_t pids[NBMAXC];
+    
+    copy = strdup(line); //4.4 remplace copyString par strdup()
+    if(copy == NULL){
+        perror("Error duplicating line for pipe execution");
+        exit(EXIT_FAILURE);
+    }
+    aux = copy;
+
+    while((cmd = strsep(&aux, "|")) != NULL){
+        if(*cmd == '\0') continue;
+        if(nCommands >= NBMAXC){
+            fprintf(stderr, "Error: Too many commands in pipeline (max %d).\n", NBMAXC);
+            free(copy);
+            exit(EXIT_FAILURE);
+        }
+        commands[nCommands++] = cmd;
+    }
+
+    if(nCommands == 0){
+        free(copy);
+        return;
+    }
+
+    for(i=0; i<nCommands-1; i++){
+        if(pipe(pipes[i]) < 0){
+            perror("Error creating pipe");
+            int j;
+            for(j=0; j<i; j++){
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            free(copy);
+            return;
+        }
+    }
+
+    for(i=0; i<nCommands; i++){
+        pids[i] = -1;
+
+        pids[i] = fork();
+        if(pids[i] < 0){
+            perror("Error forking process");
+            int j;
+            for(j=0; j<nCommands-1; j++){
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+            free(copy);
+            return;
+        }
+
+        if(pids[i] == 0){
+            if(i > 0){
+                if(dup2(pipes[i-1][0], STDIN_FILENO) < 0){
+                    perror("dup2 stdin");
+                    exit(EXIT_FAILURE);
+                }
+            }
+
+            if(i < nCommands - 1){
+                if(dup2(pipes[i][1], STDOUT_FILENO) < 0){
+                    perror("dup2 stdout");
+                    exit(EXIT_FAILURE);
+                }
+            }
+
+            int j;
+            for(j = 0; j < nCommands - 1; j++){
+                close(pipes[j][0]);
+                close(pipes[j][1]);
+            }
+
+            if(analyseCom(commands[i]) == 0){
+                exit(0);
+            }
+
+            #ifdef TRACE
+                printf("[TRACE] pipe: filho %d executando: %s\n", i, words[0]);
+            #endif
+
+            if(!execComInt(nWords, words)){
+                execvp(words[0], words);
+                fprintf(stderr, "%s: command not found\n", words[0]);
+                exit(EXIT_FAILURE);
+            }
+            exit(0);
+        }
+    }
+
+    
+    for(i=0; i<nCommands-1; i++){
+        close(pipes[i][0]);
+        close(pipes[i][1]);
+    }
+
+    for(i=0; i<nCommands; i++){
+        if(pids[i] == -1) continue;
+        int status;
+        waitpid(pids[i], &status, 0);
+        #ifdef TRACE
+            printf("[TRACE] pipe: filho %d terminou com status %d\n", i, WEXITSTATUS(status));
+        #endif
+    }
+
+    free(copy);
 }
 
 static int Exit(int argc, char **argv){
