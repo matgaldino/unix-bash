@@ -8,7 +8,7 @@
 #include<string.h>
 #include"gescom.h"
 
-#define BICEPS_VERSION "1.00"
+#define BICEPS_VERSION "1.2"
 
 char *buildPrompt(void);
 void intHandler(int s);
