@@ -1,3 +1,12 @@
+udp: servudp cliudp
+
+cliudp : cliudp.c
+	cc -Wall -o cliudp cliudp.c
+
+servudp : servudp.c
+	cc -Wall -o servudp servudp.c
+
+
 triceps: triceps.c
 	cc -o triceps triceps.c
 
@@ -20,4 +29,5 @@ clean:
 	rm -f triceps
 	rm -f biceps
 	rm -f biceps-debug
+	rm -f cliudp servudp
 	rm -f *.o

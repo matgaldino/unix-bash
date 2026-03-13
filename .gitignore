@@ -1,6 +1,8 @@
 biceps
 triceps
 biceps-debug
+cliudp
+servudp
 
 *.o
 vgcore.*
