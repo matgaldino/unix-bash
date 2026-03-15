@@ -1,61 +1,152 @@
-# UNIX SHELL - biceps 
+# UNIX SHELL - biceps
 
-**biceps** — *Bel Interpréteur de Commandes des Élèves de Polytech Sorbonne* — is a Unix shell implementation written in C, developed as part of a OS course at Polytech Sorbonne. It implements the core features of a Bourne-style shell using POSIX-standard C libraries.
-
----
-
-## Features
-
-- **Interactive prompt** — displays `user@machine$` (or `#` for root), built dynamically using `getenv`, `gethostname`, and `getuid`
-- **Persistent history** — saved across sessions to `~/.biceps_history` via `readline`, with no consecutive duplicates
-- **Sequential commands** — `;` separator: `ls ; pwd ; echo done`
-- **Internal commands** — built-ins executed directly in the shell process:
-  - `exit` — saves history and exits with a goodbye message
-  - `help` — lists all internal commands
-  - `cd [dir]` — changes directory (defaults to `$HOME`)
-  - `pwd` — prints current working directory
-  - `vers` — displays biceps and gescom library versions
-- **External commands** — executes any program via `fork` + `execvp` + `waitpid`
-- **Pipes** — pipelines of arbitrary length: `ls -l | grep .c | wc -l`
-- **I/O Redirections** — `<`, `<<`, `>`, `>>`, `2>`, `2>>`
-- **Signal handling** — `Ctrl+C` redisplays the prompt; `Ctrl+D` exits cleanly
-- **TRACE mode** — compile with `-DTRACE` for debug output
+`biceps` is a Unix shell written in C for an Operating Systems course.
+It now includes:
+- Shell core (`biceps` + `gescom`)
+- Network module (`creme`)
+- BEUIP protocol server/client (`servbeuip`, `clibeuip`)
+- Internal shell commands to control and use BEUIP from inside `biceps`
 
 ---
 
-## Project Structure
-```
+## Implemented Features
+
+### Shell (`biceps` / `gescom`)
+- Interactive prompt: `user@machine$` (or `#` for root)
+- Persistent readline history (`~/.biceps_history`)
+- Internal commands: `exit`, `help`, `cd`, `pwd`, `vers`, `beuip`, `mess`
+- External commands via `fork` + `execvp`
+- Sequential commands with `;`
+- Pipelines (`|`) and redirections (`<`, `<<`, `>`, `>>`, `2>`, `2>>`)
+- `Ctrl+C` prompt refresh and clean `Ctrl+D` exit
+
+### BEUIP v1 (`servbeuip` / `clibeuip`)
+- UDP server on port `9998`
+- Presence broadcast (`code=1`) and ACK (`code=2`)
+- Peer table `(ip, pseudo)` with duplicate protection
+- `code=3`: list request
+- `code=4`: private message (`pseudo\0message` payload)
+- `code=5`: message to all
+- `code=9`: delivered text
+- `code=0`: leave notification
+- Security gate: `code 3/4/5` accepted only from `127.0.0.1`
+- Graceful shutdown sends `code=0`
+
+### Biceps v2 Internal Network Commands
+- `beuip start <pseudo>`: starts `servbeuip` as child process
+- `beuip stop`: sends `SIGINT` to child server (graceful stop)
+- `exit`: also stops running BEUIP child server automatically
+- `mess list`: asks local BEUIP server to print online pseudos
+- `mess to <pseudo> <message>`: sends private message
+- `mess all <message>`: sends message to all
+
+`vers` now prints versions of:
+- `gescom`
+- `creme`
+- `biceps`
+
+---
+
+## BEUIP Message Format
+
+Message structure:
+- Byte 1: code (`'0'`, `'1'`, `'2'`, `'3'`, `'4'`, `'5'`, `'9'`)
+- Bytes 2-6: literal tag `BEUIP`
+- Bytes 7-end: payload
+
+Payload by code:
+- `0`: pseudo leaving
+- `1`: pseudo (presence)
+- `2`: pseudo (ACK)
+- `3`: empty
+- `4`: `destPseudo\0message`
+- `5`: message text
+- `9`: message text
+
+---
+
+## Project Files
+
+```text
 .
-├── biceps.c       # Main program: prompt, signal handler, readline loop
-├── gescom.c       # Library: command parsing, execution, pipes, redirections, built-ins
-├── gescom.h       # Public interface for gescom
-├── triceps.c      # Reference minimal shell (provided by course)
+├── biceps.c       # shell main loop and prompt
+├── gescom.c       # command engine and internal commands
+├── gescom.h
+├── creme.c        # reusable BEUIP/network logic
+├── creme.h
+├── servbeuip.c    # BEUIP server executable
+├── clibeuip.c     # BEUIP test client executable
+├── servudp.c      # basic UDP server example
+├── cliudp.c       # basic UDP client example
+├── triceps.c      # minimal reference shell
 └── Makefile
 ```
 
-Two independently versioned components:
-- **biceps** `v1.00` — the shell program
-- **gescom** `v1.2` — the command management library
+Versioned components used by `biceps`:
+- `biceps` shell: `v1.0`
+- `gescom` module: `v1.2`
+- `creme` module: `v1.0`
 
 ---
 
 ## Build
 
-**Requirements:** `gcc`, `libreadline-dev`
-```bash
-sudo apt install libreadline-dev  # Debian/Ubuntu
+Requirements:
+- `gcc`
+- `libreadline-dev`
 
-make                # build
-make biceps-debug   # build with -DTRACE
-make biceps-valgrind # run valgrind
+Install readline (Debian/Ubuntu):
+```bash
+sudo apt install libreadline-dev
+```
+
+Common targets:
+```bash
+make udp          # build servudp + cliudp
+make beuip        # build servbeuip + clibeuip
+make biceps       # build shell
+make biceps-debug # build with -DTRACE and debug symbols
+make biceps-valgrind
 make clean
 ```
 
 ---
 
-## Implementation Notes
+## Quick Usage
 
-- All internal functions in `gescom.c` are `static` — only the strictly necessary symbols are exported, verifiable with `nm gescom.o`
-- `analyseCom` runs inside each child process in pipelines to avoid race conditions on the global `words` array
-- `applyRedirections()` strips redirection tokens from `words[]` inside the child before `execvp`
-- `strdup` replaces a hand-written `copyString` from earlier versions (kept commented for reference)
+Start shell:
+```bash
+./biceps
+```
+
+Inside `biceps`:
+```text
+vers
+beuip start matheus
+mess list
+mess to alice hello alice
+mess all hello everyone
+beuip stop
+exit
+```
+
+Standalone BEUIP test:
+```bash
+./servbeuip matheus
+./clibeuip alice
+./clibeuip 3
+./clibeuip 4 alice "hello"
+./clibeuip 5 "hello all"
+./clibeuip 0 alice
+```
+
+---
+
+## TRACE Mode
+
+Compile with TRACE enabled:
+```bash
+make biceps-debug
+```
+
+This enables conditional debug messages guarded by `#ifdef TRACE`.
