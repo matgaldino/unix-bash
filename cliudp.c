@@ -29,7 +29,7 @@ struct sockaddr_in SockAck;
 socklen_t lAck;
 
     if (N != 4) {
-        fprintf(stderr,"Utilisation : %s nom_serveur port message\n", P[0]);
+        fprintf(stderr,"Usage: %s <server_name> <port> <message>\n", P[0]);
         return(1);
     }
     /* creation du socket */
@@ -37,7 +37,7 @@ socklen_t lAck;
         perror("socket");
         return(2);
     }
-    /* recuperation adresse du serveur */
+    /* resolve server address */
     if (!(h=gethostbyname(P[1]))) {
         perror(P[1]);
         return(3);
@@ -45,7 +45,7 @@ socklen_t lAck;
     bzero(&Sock,sizeof(Sock));
     Sock.sin_family = AF_INET;
     if (h->h_addr_list == NULL || h->h_addr_list[0] == NULL) {
-        fprintf(stderr, "Endereco do servidor indisponivel\n");
+        fprintf(stderr, "Server address unavailable\n");
         return(3);
     }
     memcpy(&Sock.sin_addr, h->h_addr_list[0], h->h_length);
@@ -55,7 +55,7 @@ socklen_t lAck;
         perror("sendto");
         return(4);
     }
-    printf("Envoi OK !\n");
+    printf("Send OK!\n");
 
     lAck = sizeof(SockAck);
     n = recvfrom(sid, (void *)buf, LBUF, 0, (struct sockaddr *)&SockAck, &lAck);
@@ -64,7 +64,7 @@ socklen_t lAck;
         return(5);
     }
     buf[n] = '\0';
-    printf("AR recu : <%s>\n", buf);
+    printf("ACK received: <%s>\n", buf);
 
     return 0;
 }

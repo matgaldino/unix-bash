@@ -279,7 +279,7 @@ int creme_handle_server_datagram(int sid, const char *selfPseudo, creme_peer_tab
 
         outLen = creme_build_message(BEUIP_CODE_TEXT, text, outMsg, sizeof(outMsg));
         if(outLen < 0){
-            fprintf(stderr, "message code=9 trop long\n");
+            fprintf(stderr, "message code=9 too long\n");
             return 1;
         }
 
@@ -310,7 +310,7 @@ int creme_handle_server_datagram(int sid, const char *selfPseudo, creme_peer_tab
 
         outLen = creme_build_message(BEUIP_CODE_TEXT, text, outMsg, sizeof(outMsg));
         if(outLen < 0){
-            fprintf(stderr, "message code=9 trop long\n");
+            fprintf(stderr, "message code=9 too long\n");
             return 1;
         }
 
@@ -358,7 +358,7 @@ int creme_handle_server_datagram(int sid, const char *selfPseudo, creme_peer_tab
     }
 
     if(creme_add_peer(table, remoteIpHost, pseudo) < 0){
-        fprintf(stderr, "Table peers pleine (%d). Ignore %s/%s\n",
+        fprintf(stderr, "Peer table full (%d). Ignoring %s/%s\n",
                 BEUIP_MAX_PEERS, creme_addrip(remoteIpHost), pseudo);
         return 1;
     }
@@ -369,7 +369,7 @@ int creme_handle_server_datagram(int sid, const char *selfPseudo, creme_peer_tab
     if(code == BEUIP_CODE_BROADCAST){
         outLen = creme_build_message(BEUIP_CODE_ACK, selfPseudo, outMsg, sizeof(outMsg));
         if(outLen < 0){
-            fprintf(stderr, "ACK non envoye: message trop long\n");
+            fprintf(stderr, "ACK not sent: message too long\n");
             return 1;
         }
 

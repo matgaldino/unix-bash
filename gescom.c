@@ -4,15 +4,18 @@
 #include<unistd.h>
 #include<string.h>
 #include<sys/wait.h>
+#include<signal.h>
 #include<readline/history.h>
 #include<fcntl.h>
 #include "gescom.h"
+#include "creme.h"
 
 #define GESCOM_VERSION "1.2"
 static char *shell_version = "unknown";
 
 static char **words;
 static int nWords;
+static pid_t beuipServerPid = -1;
 
 static comInt tabCom[NBMAXC];
 static int nCom = 0;
@@ -38,6 +41,7 @@ static int Help(int argc, char **argv);
 static int Cd(int argc, char **argv);
 static int Pwd(int argc, char **argv);
 static int Vers(int argc, char **argv);
+static int Beuip(int argc, char **argv);
 
 static int analyseCom(char *b){
     char *copy, *token, *aux, *sep = " \t\n";
@@ -115,6 +119,7 @@ void updateComInt(char *bicepsVersion){
     addCom("cd", Cd);
     addCom("pwd", Pwd);
     addCom("vers", Vers);
+    addCom("beuip", Beuip);
 }
 
 void listComInt(void){
@@ -578,6 +583,83 @@ static int Vers(int argc, char **argv){
     (void)argc;
     (void)argv;
     printf("gescom library version v%s\n", GESCOM_VERSION);
+    printf("creme library version v%s\n", creme_version());
     printf("biceps shell version v%s\n", shell_version);
+    return 0;
+}
+
+static int Beuip(int argc, char **argv){
+    pid_t pid;
+    int status;
+
+    if(beuipServerPid > 0){
+        pid = waitpid(beuipServerPid, &status, WNOHANG);
+        if(pid == beuipServerPid){
+            beuipServerPid = -1;
+        }
+    }
+
+    if(argc < 2){
+        fprintf(stderr, "Usage: beuip start <pseudo> | beuip stop\n");
+        return 1;
+    }
+
+    if(strcmp(argv[1], "stop") == 0){
+        if(argc != 2){
+            fprintf(stderr, "Usage: beuip stop\n");
+            return 1;
+        }
+
+        if(beuipServerPid <= 0){
+            fprintf(stderr, "beuip: no server started by this biceps instance.\n");
+            return 1;
+        }
+
+        if(kill(beuipServerPid, SIGINT) == -1){
+            perror("beuip: kill(SIGINT)");
+            beuipServerPid = -1;
+            return 1;
+        }
+
+        if(waitpid(beuipServerPid, &status, 0) == -1){
+            perror("beuip: waitpid");
+            beuipServerPid = -1;
+            return 1;
+        }
+
+        printf("beuip: server stopped pid=%d\n", (int)beuipServerPid);
+        beuipServerPid = -1;
+        return 0;
+    }
+
+    if(strcmp(argv[1], "start") != 0 || argc != 3){
+        fprintf(stderr, "Usage: beuip start <pseudo> | beuip stop\n");
+        return 1;
+    }
+
+    if(beuipServerPid > 0){
+        fprintf(stderr, "beuip: server already running pid=%d\n", (int)beuipServerPid);
+        return 1;
+    }
+
+    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
+        fprintf(stderr, "beuip: invalid pseudo (1..%d chars).\n", BEUIP_MAX_PSEUDO_LEN - 1);
+        return 1;
+    }
+
+    pid = fork();
+    if(pid < 0){
+        perror("beuip: fork");
+        return 1;
+    }
+
+    if(pid == 0){
+        execl("./servbeuip", "servbeuip", argv[2], (char *)NULL);
+        perror("beuip: exec ./servbeuip");
+        _exit(127);
+    }
+
+    beuipServerPid = pid;
+    printf("beuip: server started with pid=%d pseudo=%s\n", (int)pid, argv[2]);
     return 0;
 }

@@ -15,7 +15,7 @@
 #define LBUF 512
 
 char buf[LBUF+1];
-const char *ack = "Bien reçu 5/5 !";
+const char *ack = "ACK 5/5!";
 struct sockaddr_in SockConf; /* pour les operation du serveur : mise a zero */
 
 char * addrip(unsigned long A)
@@ -44,7 +44,7 @@ socklen_t ls;
         perror("bind");
         return(3);
     }
-    printf("Le serveur est attache au port %d !\n",PORT);
+    printf("Server bound to port %d!\n",PORT);
     for (;;) {
       ls = sizeof(Sock);
       /* on attend un message */
@@ -52,7 +52,7 @@ socklen_t ls;
            == -1)  perror("recvfrom");
       else {
         buf[n] = '\0';
-        printf ("recu de %s : <%s>\n",addrip(ntohl(Sock.sin_addr.s_addr)), buf);
+        printf ("received from %s: <%s>\n",addrip(ntohl(Sock.sin_addr.s_addr)), buf);
 
         if (sendto(sid, ack, strlen(ack), MSG_CONFIRM,
                    (struct sockaddr *)&Sock, ls) == -1) {

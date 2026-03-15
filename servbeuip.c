@@ -42,12 +42,12 @@ int main(int N, char *P[]){
     socklen_t ls;
 
     if(N != 2){
-        fprintf(stderr, "Utilisation : %s pseudo\n", P[0]);
+        fprintf(stderr, "Usage: %s <pseudo>\n", P[0]);
         return 1;
     }
 
     if(strlen(P[1]) == 0 || strlen(P[1]) >= BEUIP_MAX_PSEUDO_LEN){
-        fprintf(stderr, "Pseudo invalide (1..%d caracteres).\n", BEUIP_MAX_PSEUDO_LEN - 1);
+        fprintf(stderr, "Invalid pseudo (1..%d chars).\n", BEUIP_MAX_PSEUDO_LEN - 1);
         return 1;
     }
 
@@ -86,17 +86,17 @@ int main(int N, char *P[]){
     printf("[SERVER] BEUIP listening on UDP %d | pseudo=%s\n", BEUIP_PORT, P[1]);
 
     if(!creme_prepare_ipv4_addr(&sockBroadcast, BEUIP_BROADCAST_IP, BEUIP_PORT)){
-        fprintf(stderr, "Adresse broadcast invalide: %s\n", BEUIP_BROADCAST_IP);
+        fprintf(stderr, "Invalid broadcast address: %s\n", BEUIP_BROADCAST_IP);
         close(sid);
         return 4;
     }
 
     if(creme_send_presence(sid, &sockBroadcast, P[1]) == -1){
-        fprintf(stderr, "Message initial trop long\n");
+        fprintf(stderr, "Initial message too long\n");
         perror("sendto broadcast");
     } else {
         #ifdef TRACE
-        printf("[TRACE] broadcast presence envoye vers %s:%d\n", BEUIP_BROADCAST_IP, BEUIP_PORT);
+        printf("[TRACE] broadcast presence sent to %s:%d\n", BEUIP_BROADCAST_IP, BEUIP_PORT);
         #endif
     }
 
