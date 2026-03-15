@@ -1,11 +1,18 @@
 udp: servudp cliudp
 
+beuip: servbeuip clibeuip
+
 cliudp : cliudp.c
 	cc -Wall -o cliudp cliudp.c
 
 servudp : servudp.c
 	cc -Wall -o servudp servudp.c
 
+servbeuip : servbeuip.c
+	cc -Wall -o servbeuip servbeuip.c
+
+clibeuip : clibeuip.c
+	cc -Wall -o clibeuip clibeuip.c
 
 triceps: triceps.c
 	cc -o triceps triceps.c
@@ -29,5 +36,6 @@ clean:
 	rm -f triceps
 	rm -f biceps
 	rm -f biceps-debug
+	rm -f servbeuip clibeuip
 	rm -f cliudp servudp
 	rm -f *.o

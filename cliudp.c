@@ -44,7 +44,11 @@ socklen_t lAck;
     }
     bzero(&Sock,sizeof(Sock));
     Sock.sin_family = AF_INET;
-    bcopy(h->h_addr,&Sock.sin_addr,h->h_length);
+    if (h->h_addr_list == NULL || h->h_addr_list[0] == NULL) {
+        fprintf(stderr, "Endereco do servidor indisponivel\n");
+        return(3);
+    }
+    memcpy(&Sock.sin_addr, h->h_addr_list[0], h->h_length);
     Sock.sin_port = htons(atoi(P[2]));
     if (sendto(sid,P[3],strlen(P[3]),0,(struct sockaddr *)&Sock,
                            sizeof(Sock))==-1) {

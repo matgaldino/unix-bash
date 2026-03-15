@@ -3,7 +3,9 @@ triceps
 biceps-debug
 cliudp
 servudp
-
+servbeuip
+servbeuip-debug
+clibeuip
 *.o
 vgcore.*
 
