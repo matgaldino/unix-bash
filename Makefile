@@ -2,17 +2,20 @@ udp: servudp cliudp
 
 beuip: servbeuip clibeuip
 
+creme.o: creme.c creme.h
+	cc -o creme.o -c creme.c -Wall
+
 cliudp : cliudp.c
 	cc -Wall -o cliudp cliudp.c
 
 servudp : servudp.c
 	cc -Wall -o servudp servudp.c
 
-servbeuip : servbeuip.c
-	cc -Wall -o servbeuip servbeuip.c
+servbeuip : servbeuip.c creme.h creme.o
+	cc -Wall -o servbeuip servbeuip.c creme.o
 
-clibeuip : clibeuip.c
-	cc -Wall -o clibeuip clibeuip.c
+clibeuip : clibeuip.c creme.h creme.o
+	cc -Wall -o clibeuip clibeuip.c creme.o
 
 triceps: triceps.c
 	cc -o triceps triceps.c
@@ -36,6 +39,7 @@ clean:
 	rm -f triceps
 	rm -f biceps
 	rm -f biceps-debug
+	rm -f creme.o
 	rm -f servbeuip clibeuip
 	rm -f cliudp servudp
 	rm -f *.o
