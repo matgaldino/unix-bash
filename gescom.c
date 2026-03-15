@@ -11,6 +11,7 @@
 #include "creme.h"
 
 #define GESCOM_VERSION "1.2"
+#define MESS_SERVER_IP "127.0.0.1"
 static char *shell_version = "unknown";
 
 static char **words;
@@ -42,6 +43,9 @@ static int Cd(int argc, char **argv);
 static int Pwd(int argc, char **argv);
 static int Vers(int argc, char **argv);
 static int Beuip(int argc, char **argv);
+static int Mess(int argc, char **argv);
+static char *joinArgs(int start, int argc, char **argv);
+static int stopBeuipServer(void);
 
 static int analyseCom(char *b){
     char *copy, *token, *aux, *sep = " \t\n";
@@ -120,6 +124,7 @@ void updateComInt(char *bicepsVersion){
     addCom("pwd", Pwd);
     addCom("vers", Vers);
     addCom("beuip", Beuip);
+    addCom("mess", Mess);
 }
 
 void listComInt(void){
@@ -532,6 +537,11 @@ static int Exit(int argc, char **argv){
     historyPath = getHistoryPath();
     write_history(historyPath);
     free(historyPath);
+
+    if(beuipServerPid > 0){
+        stopBeuipServer();
+    }
+
     printf("Exiting biceps shell. Goodbye!\n");
     exit(0);
 }
@@ -615,21 +625,7 @@ static int Beuip(int argc, char **argv){
             return 1;
         }
 
-        if(kill(beuipServerPid, SIGINT) == -1){
-            perror("beuip: kill(SIGINT)");
-            beuipServerPid = -1;
-            return 1;
-        }
-
-        if(waitpid(beuipServerPid, &status, 0) == -1){
-            perror("beuip: waitpid");
-            beuipServerPid = -1;
-            return 1;
-        }
-
-        printf("beuip: server stopped pid=%d\n", (int)beuipServerPid);
-        beuipServerPid = -1;
-        return 0;
+        return stopBeuipServer();
     }
 
     if(strcmp(argv[1], "start") != 0 || argc != 3){
@@ -662,4 +658,173 @@ static int Beuip(int argc, char **argv){
     beuipServerPid = pid;
     printf("beuip: server started with pid=%d pseudo=%s\n", (int)pid, argv[2]);
     return 0;
+}
+
+static int stopBeuipServer(void){
+    int status;
+    pid_t waited;
+
+    if(beuipServerPid <= 0){
+        return 0;
+    }
+
+    if(kill(beuipServerPid, SIGINT) == -1){
+        perror("beuip: kill(SIGINT)");
+        beuipServerPid = -1;
+        return 1;
+    }
+
+    #ifdef TRACE
+    printf("[TRACE] beuip: sent SIGINT to pid=%d\n", (int)beuipServerPid);
+    #endif
+
+    waited = waitpid(beuipServerPid, &status, 0);
+    if(waited == -1){
+        perror("beuip: waitpid");
+        beuipServerPid = -1;
+        return 1;
+    }
+
+    printf("beuip: server stopped pid=%d\n", (int)beuipServerPid);
+    beuipServerPid = -1;
+    return 0;
+}
+
+static char *joinArgs(int start, int argc, char **argv){
+    int i;
+    size_t total = 1;
+    char *msg;
+
+    for(i = start; i < argc; i++){
+        total += strlen(argv[i]);
+        if(i + 1 < argc) total += 1;
+    }
+
+    msg = malloc(total);
+    if(msg == NULL){
+        perror("mess: malloc");
+        return NULL;
+    }
+
+    msg[0] = '\0';
+    for(i = start; i < argc; i++){
+        strcat(msg, argv[i]);
+        if(i + 1 < argc) strcat(msg, " ");
+    }
+
+    return msg;
+}
+
+static int Mess(int argc, char **argv){
+    int sid;
+    int rc;
+    struct sockaddr_in sockServer;
+    char *msg;
+
+    if(argc < 2){
+        fprintf(stderr, "Usage: mess list | mess to <pseudo> <message> | mess all <message>\n");
+        return 1;
+    }
+
+    if((sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0){
+        perror("mess: socket");
+        return 1;
+    }
+
+    if(!creme_prepare_ipv4_addr(&sockServer, MESS_SERVER_IP, BEUIP_PORT)){
+        fprintf(stderr, "mess: invalid server address: %s\n", MESS_SERVER_IP);
+        close(sid);
+        return 1;
+    }
+
+    if(strcmp(argv[1], "list") == 0){
+        if(argc != 2){
+            fprintf(stderr, "Usage: mess list\n");
+            close(sid);
+            return 1;
+        }
+        rc = creme_send_list_request(sid, &sockServer);
+        if(rc == -1){
+            fprintf(stderr, "mess: failed to send list request\n");
+            close(sid);
+            return 1;
+        }
+        printf("mess: list request sent (server prints online pseudos)\n");
+        #ifdef TRACE
+        printf("[TRACE] mess list -> code=3\n");
+        #endif
+        close(sid);
+        return 0;
+    }
+
+    if(strcmp(argv[1], "to") == 0){
+        if(argc < 4){
+            fprintf(stderr, "Usage: mess to <pseudo> <message>\n");
+            close(sid);
+            return 1;
+        }
+        if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
+            fprintf(stderr, "mess: invalid destination pseudo (1..%d chars)\n", BEUIP_MAX_PSEUDO_LEN - 1);
+            close(sid);
+            return 1;
+        }
+
+        msg = joinArgs(3, argc, argv);
+        if(msg == NULL){
+            close(sid);
+            return 1;
+        }
+
+        rc = creme_send_private_message(sid, &sockServer, argv[2], msg);
+        if(rc == -1){
+            fprintf(stderr, "mess: private message too long\n");
+            free(msg);
+            close(sid);
+            return 1;
+        }
+
+        printf("mess: private message sent to %s\n", argv[2]);
+        #ifdef TRACE
+        printf("[TRACE] mess to %s -> code=4 msg='%s'\n", argv[2], msg);
+        #endif
+
+        free(msg);
+        close(sid);
+        return 0;
+    }
+
+    if(strcmp(argv[1], "all") == 0){
+        if(argc < 3){
+            fprintf(stderr, "Usage: mess all <message>\n");
+            close(sid);
+            return 1;
+        }
+
+        msg = joinArgs(2, argc, argv);
+        if(msg == NULL){
+            close(sid);
+            return 1;
+        }
+
+        rc = creme_send_broadcast_text(sid, &sockServer, msg);
+        if(rc == -1){
+            fprintf(stderr, "mess: broadcast message too long\n");
+            free(msg);
+            close(sid);
+            return 1;
+        }
+
+        printf("mess: broadcast message sent\n");
+        #ifdef TRACE
+        printf("[TRACE] mess all -> code=5 msg='%s'\n", msg);
+        #endif
+
+        free(msg);
+        close(sid);
+        return 0;
+    }
+
+    fprintf(stderr, "Usage: mess list | mess to <pseudo> <message> | mess all <message>\n");
+    close(sid);
+    return 1;
 }
