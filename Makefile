@@ -1,45 +1,37 @@
-udp: servudp cliudp
+CC = cc
+CFLAGS = -Wall -Werror
+DEBUG_CFLAGS = $(CFLAGS) -g -DTRACE
+READLINE_LIB = -lreadline
 
 beuip: servbeuip clibeuip
 
 creme.o: creme.c creme.h
-	cc -o creme.o -c creme.c -Wall
-
-cliudp : cliudp.c
-	cc -Wall -o cliudp cliudp.c
-
-servudp : servudp.c
-	cc -Wall -o servudp servudp.c
+	$(CC) $(CFLAGS) -o creme.o -c creme.c
 
 servbeuip : servbeuip.c creme.h creme.o
-	cc -Wall -o servbeuip servbeuip.c creme.o
+	$(CC) $(CFLAGS) -o servbeuip servbeuip.c creme.o
 
 clibeuip : clibeuip.c creme.h creme.o
-	cc -Wall -o clibeuip clibeuip.c creme.o
-
-triceps: triceps.c
-	cc -o triceps triceps.c
+	$(CC) $(CFLAGS) -o clibeuip clibeuip.c creme.o
 
 biceps: biceps.o gescom.o creme.o
-	cc -o biceps biceps.o gescom.o creme.o -Wall -lreadline
+	$(CC) $(CFLAGS) -o biceps biceps.o gescom.o creme.o $(READLINE_LIB)
 
 biceps.o: biceps.c gescom.h
-	cc -o biceps.o -c biceps.c -Wall
+	$(CC) $(CFLAGS) -o biceps.o -c biceps.c
 
 gescom.o: gescom.c gescom.h creme.h
-	cc -o gescom.o -c gescom.c -Wall
+	$(CC) $(CFLAGS) -o gescom.o -c gescom.c
 
 biceps-debug: biceps.c gescom.c creme.c gescom.h creme.h
-	cc -o biceps-debug biceps.c gescom.c creme.c -Wall -Werror -lreadline -g -DTRACE
+	$(CC) $(DEBUG_CFLAGS) -o biceps-debug biceps.c gescom.c creme.c $(READLINE_LIB)
 
 biceps-valgrind: biceps-debug
 	valgrind --leak-check=full ./biceps-debug
 
 clean:
-	rm -f triceps
 	rm -f biceps
 	rm -f biceps-debug
 	rm -f creme.o
 	rm -f servbeuip clibeuip
-	rm -f cliudp servudp
 	rm -f *.o

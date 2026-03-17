@@ -21,21 +21,42 @@ static pid_t beuipServerPid = -1;
 static comInt tabCom[NBMAXC];
 static int nCom = 0;
 
+typedef struct {
+    const char *token;
+    void (*handler)(int);
+} redirection_rule;
+
 static int analyseCom(char *b);
+static char *dupLineOrExit(const char *src, const char *context);
+static void addTokenWord(const char *token);
 static void freeWords(void);
 static void addCom(char *name, int (*f)(int, char **));
 static int execComInt(int argc, char **argv);
 static int execComExt(char **argv);
+static void runExternalChild(char **argv);
+static int waitExternalChild(pid_t pid);
+static void execSimpleCommand(char *cmd);
 static void execPipe(char *line);
+static int splitPipeCommands(char *copy, char **commands);
+static int createPipeArray(int pipes[][2], int nCommands);
+static void closePipeArray(int pipes[][2], int nPipes);
+static void runPipeChild(int idx, int nCommands, int pipes[][2], char *cmd);
+static int forkPipeChildren(int nCommands, int pipes[][2], pid_t pids[], char **commands);
+static void waitPipeChildren(pid_t pids[], int nCommands);
 static void applyRedirections(void);
 static void freeRedirectionTokens(int i);
 static void ensureRedirectionOperand(int i, const char *op, const char *what);
 static void redirectInputFromFile(int i);
 static void redirectInputFromHeredoc(int i);
+static void readHeredocIntoPipe(int writeFd, const char *delim);
+static void connectPipeToStdin(int readFd);
 static void redirectStdoutToFile(int i);
 static void redirectStdoutAppendToFile(int i);
 static void redirectStderrToFile(int i);
 static void redirectStderrAppendToFile(int i);
+static int findRedirectionHandler(const char *token);
+static int applyOneRedirection(int i);
+static void keepFilteredWord(char **filtered, int *newWords, int idx);
 
 static int Exit(int argc, char **argv);
 static int Help(int argc, char **argv);
@@ -43,37 +64,67 @@ static int Cd(int argc, char **argv);
 static int Pwd(int argc, char **argv);
 static int Vers(int argc, char **argv);
 static int Beuip(int argc, char **argv);
+static void refreshBeuipServerPid(void);
+static int handleBeuipStop(int argc);
+static int validateBeuipStartArgs(int argc, char **argv);
+static int spawnBeuipServer(const char *pseudo);
+static int sendBeuipStopSignal(void);
+static int waitBeuipStop(void);
 static int Mess(int argc, char **argv);
+static int messUsage(void);
 static char *joinArgs(int start, int argc, char **argv);
+static size_t joinedArgsLength(int start, int argc, char **argv);
+static void appendJoinedArgs(char *msg, int start, int argc, char **argv);
+static int initMessSocketAndAddr(int *sid, struct sockaddr_in *sockServer);
+static int messListCommand(int argc, int sid, const struct sockaddr_in *sockServer);
+static int messToCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer);
+static int messAllCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer);
 static int stopBeuipServer(void);
 
+static char *dupLineOrExit(const char *src, const char *context){
+    char *copy;
+
+    copy = strdup(src);
+    if(copy == NULL){
+        perror(context);
+        exit(EXIT_FAILURE);
+    }
+    return copy;
+}
+
+static void addTokenWord(const char *token){
+    char **newWords;
+
+    newWords = realloc(words, (nWords + 2) * sizeof(char *));
+    if(newWords == NULL){
+        perror("Error reallocating memory for words array");
+        exit(EXIT_FAILURE);
+    }
+    words = newWords;
+    words[nWords++] = strdup(token);
+    if(words[nWords - 1] == NULL){
+        perror("Error duplicating command token");
+        exit(EXIT_FAILURE);
+    }
+}
+
 static int analyseCom(char *b){
-    char *copy, *token, *aux, *sep = " \t\n";
+    char *copy, *token, *aux;
 
     nWords = 0;
     words = NULL;
-    copy = strdup(b); //4.4 remplace copyString par strdup() 
+    copy = dupLineOrExit(b, "Error duplicating command line");
     aux = copy;
-
-    while((token = strsep(&aux, sep)) != NULL){
-        if(*token == '\0') continue;
-        
-        words = realloc(words, (nWords + 2)*sizeof(char*));
-
-        if(words == NULL){
-            perror("Error reallocating memory for words array");
-            free(copy);
-            exit(EXIT_FAILURE);
+    while((token = strsep(&aux, " \t\n")) != NULL){
+        if(*token != '\0'){
+            addTokenWord(token);
         }
-        words[nWords++] = strdup(token); //4.4 remplace copyString par strdup()
     }
-
     if(words != NULL){
-        words[nWords] = NULL; //NULL for execvp
+        words[nWords] = NULL;
     }
-    
     free(copy);
-    return nWords;          
+    return nWords;
 }
 
 /*
@@ -146,26 +197,20 @@ static int execComInt(int argc, char **argv){
     return 0;
 }
 
-static int execComExt(char **argv){
-    pid_t pid;
+static void runExternalChild(char **argv){
+    (void)argv;
+    #ifdef TRACE
+        printf("[TRACE] child pid=%d executing: %s\n", getpid(), words[0]);
+    #endif
+    applyRedirections();
+    execvp(words[0], words);
+    fprintf(stderr, "%s: command not found\n", words[0]);
+    exit(EXIT_FAILURE);
+}
+
+static int waitExternalChild(pid_t pid){
     int status;
 
-    pid = fork();
-
-    if (pid < 0){
-        perror("Error forking process");
-        return -1;
-    }else if(pid == 0){ //Child process
-        #ifdef TRACE
-            printf("[TRACE] child pid=%d executing: %s\n", getpid(), argv[0]);
-        #endif
-        applyRedirections();
-        execvp(words[0], words);
-        fprintf(stderr, "%s: command not found\n", words[0]);
-        exit(EXIT_FAILURE);
-    }
-
-    //Parent process
     #ifdef TRACE
         printf("[TRACE] parent pid=%d waiting for child pid=%d\n", getpid(), pid);
     #endif
@@ -176,37 +221,51 @@ static int execComExt(char **argv){
     return WEXITSTATUS(status);
 }
 
+static int execComExt(char **argv){
+    pid_t pid;
+
+    (void)argv;
+    pid = fork();
+    if (pid < 0){
+        perror("Error forking process");
+        return -1;
+    }
+    if(pid == 0){
+        runExternalChild(argv);
+    }
+    return waitExternalChild(pid);
+}
+
+static void execSimpleCommand(char *cmd){
+    if(analyseCom(cmd) > 0){
+        if(!execComInt(nWords, words)){
+            execComExt(words);
+        }
+        freeWords();
+    }
+}
+
 void execLine(char *line){
     char *copy, *cmd, *aux;
 
-    copy = strdup(line); //4.4 remplace copyString par strdup()
-    if(copy == NULL){
-        perror("Error duplicating line for command execution");
-        exit(EXIT_FAILURE);
-    }
+    copy = dupLineOrExit(line, "Error duplicating line for command execution");
     aux = copy;
-
     while((cmd = strsep(&aux, ";")) != NULL){
         #ifdef TRACE
             printf("[TRACE] execLine: sub-command: '%s'\n", cmd);
         #endif
-
         if(strchr(cmd, '|') != NULL){
             execPipe(cmd);
         }else{
-            if(analyseCom(cmd) > 0){
-                if(!execComInt(nWords, words)){
-                    execComExt(words);
-                }
-                freeWords();
-            }
+            execSimpleCommand(cmd);
         }
     }
     free(copy);
 }
 
 char *getHistoryPath(void){
-    char *home, *path;
+    const char *home;
+    char *path;
     int len;
 
     home = getenv("HOME");
@@ -228,117 +287,101 @@ char *getHistoryPath(void){
     return path;
 }
 
-static void execPipe(char *line){
-    char *commands[NBMAXC];
-    int nCommands = 0, i;
-    char *copy, *cmd, *aux;
-    int pipes[NBMAXC][2];
-    pid_t pids[NBMAXC];
-    
-    copy = strdup(line); //4.4 remplace copyString par strdup()
-    if(copy == NULL){
-        perror("Error duplicating line for pipe execution");
-        exit(EXIT_FAILURE);
-    }
-    aux = copy;
+static int splitPipeCommands(char *copy, char **commands){
+    char *aux, *cmd;
+    int nCommands;
 
+    aux = copy;
+    nCommands = 0;
     while((cmd = strsep(&aux, "|")) != NULL){
         if(*cmd == '\0') continue;
         if(nCommands >= NBMAXC){
             fprintf(stderr, "Error: Too many commands in pipeline (max %d).\n", NBMAXC);
-            free(copy);
             exit(EXIT_FAILURE);
         }
         commands[nCommands++] = cmd;
     }
+    return nCommands;
+}
 
-    if(nCommands == 0){
-        free(copy);
-        return;
-    }
+static void closePipeArray(int pipes[][2], int nPipes){
+    int i;
 
-    for(i=0; i<nCommands-1; i++){
-        if(pipe(pipes[i]) < 0){
-            perror("Error creating pipe");
-            int j;
-            for(j=0; j<i; j++){
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-            free(copy);
-            return;
-        }
-    }
-
-    for(i=0; i<nCommands; i++){
-        pids[i] = -1;
-
-        pids[i] = fork();
-        if(pids[i] < 0){
-            perror("Error forking process");
-            int j;
-            for(j=0; j<nCommands-1; j++){
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-            free(copy);
-            return;
-        }
-
-        if(pids[i] == 0){
-            if(i > 0){
-                if(dup2(pipes[i-1][0], STDIN_FILENO) < 0){
-                    perror("dup2 stdin");
-                    exit(EXIT_FAILURE);
-                }
-            }
-
-            if(i < nCommands - 1){
-                if(dup2(pipes[i][1], STDOUT_FILENO) < 0){
-                    perror("dup2 stdout");
-                    exit(EXIT_FAILURE);
-                }
-            }
-
-            int j;
-            for(j=0; j<nCommands-1; j++){
-                close(pipes[j][0]);
-                close(pipes[j][1]);
-            }
-
-            if(analyseCom(commands[i]) == 0){
-                exit(0);
-            }
-            applyRedirections();
-
-            #ifdef TRACE
-                printf("[TRACE] pipe: filho %d executando: %s\n", i, words[0]);
-            #endif
-
-            if(!execComInt(nWords, words)){
-                execvp(words[0], words);
-                fprintf(stderr, "%s: command not found\n", words[0]);
-                exit(EXIT_FAILURE);
-            }
-            exit(0);
-        }
-    }
-
-    
-    for(i=0; i<nCommands-1; i++){
+    for(i = 0; i < nPipes; i++){
         close(pipes[i][0]);
         close(pipes[i][1]);
     }
+}
 
-    for(i=0; i<nCommands; i++){
-        if(pids[i] == -1) continue;
+static int createPipeArray(int pipes[][2], int nCommands){
+    int i;
+
+    for(i = 0; i < nCommands - 1; i++){
+        if(pipe(pipes[i]) < 0){
+            perror("Error creating pipe");
+            closePipeArray(pipes, i);
+            return -1;
+        }
+    }
+    return 0;
+}
+
+static void runPipeChild(int idx, int nCommands, int pipes[][2], char *cmd){
+    if(idx > 0 && dup2(pipes[idx - 1][0], STDIN_FILENO) < 0){ perror("dup2 stdin"); exit(EXIT_FAILURE); }
+    if(idx < nCommands - 1 && dup2(pipes[idx][1], STDOUT_FILENO) < 0){ perror("dup2 stdout"); exit(EXIT_FAILURE); }
+    closePipeArray(pipes, nCommands - 1);
+    if(analyseCom(cmd) == 0) exit(0);
+    applyRedirections();
+    #ifdef TRACE
+        printf("[TRACE] pipe: filho %d executando: %s\n", idx, words[0]);
+    #endif
+    if(!execComInt(nWords, words)) execvp(words[0], words);
+    fprintf(stderr, "%s: command not found\n", words[0]);
+    exit(EXIT_FAILURE);
+}
+
+static int forkPipeChildren(int nCommands, int pipes[][2], pid_t pids[], char **commands){
+    int i;
+
+    for(i = 0; i < nCommands; i++){
+        pids[i] = fork();
+        if(pids[i] < 0){
+            perror("Error forking process");
+            return -1;
+        }
+        if(pids[i] == 0) runPipeChild(i, nCommands, pipes, commands[i]);
+    }
+    return 0;
+}
+
+static void waitPipeChildren(pid_t pids[], int nCommands){
+    int i;
+
+    for(i = 0; i < nCommands; i++){
         int status;
+
+        if(pids[i] == -1) continue;
         waitpid(pids[i], &status, 0);
         #ifdef TRACE
             printf("[TRACE] pipe: filho %d terminou com status %d\n", i, WEXITSTATUS(status));
         #endif
     }
+}
 
+static void execPipe(char *line){
+    char *commands[NBMAXC];
+    int pipes[NBMAXC][2];
+    pid_t pids[NBMAXC];
+    int nCommands;
+    char *copy;
+
+    copy = dupLineOrExit(line, "Error duplicating line for pipe execution");
+    nCommands = splitPipeCommands(copy, commands);
+    if(nCommands == 0){ free(copy); return; }
+    if(createPipeArray(pipes, nCommands) == -1){ free(copy); return; }
+    if(forkPipeChildren(nCommands, pipes, pids, commands) == -1){ closePipeArray(pipes, nCommands - 1); free(copy); return; }
+    closePipeArray(pipes, nCommands - 1);
+    waitPipeChildren(pids, nCommands);
     free(copy);
 }
 
@@ -372,38 +415,44 @@ static void redirectInputFromFile(int i){
     freeRedirectionTokens(i);
 }
 
-static void redirectInputFromHeredoc(int i){
-    int hpipe[2];
-    char *delim;
-    char *hline = NULL;
-    size_t hlen = 0;
+static void readHeredocIntoPipe(int writeFd, const char *delim){
+    char *hline;
+    size_t hlen;
 
-    ensureRedirectionOperand(i, "<<", "delimiter");
-    delim = words[i+1];
-
-    if(pipe(hpipe) < 0){
-        perror("pipe heredoc");
-        exit(EXIT_FAILURE);
-    }
-
+    hline = NULL;
+    hlen = 0;
     while(1){
         printf("> ");
         fflush(stdout);
         if(getline(&hline, &hlen, stdin) < 0) break;
         hline[strcspn(hline, "\n")] = '\0';
         if(strcmp(hline, delim) == 0) break;
-        write(hpipe[1], hline, strlen(hline));
-        write(hpipe[1], "\n", 1);
+        write(writeFd, hline, strlen(hline));
+        write(writeFd, "\n", 1);
     }
-
     free(hline);
-    close(hpipe[1]);
-    if(dup2(hpipe[0], STDIN_FILENO) < 0){
+}
+
+static void connectPipeToStdin(int readFd){
+    if(dup2(readFd, STDIN_FILENO) < 0){
         perror("dup2 stdin");
-        close(hpipe[0]);
+        close(readFd);
         exit(EXIT_FAILURE);
     }
-    close(hpipe[0]);
+    close(readFd);
+}
+
+static void redirectInputFromHeredoc(int i){
+    int hpipe[2];
+
+    ensureRedirectionOperand(i, "<<", "delimiter");
+    if(pipe(hpipe) < 0){
+        perror("pipe heredoc");
+        exit(EXIT_FAILURE);
+    }
+    readHeredocIntoPipe(hpipe[1], words[i + 1]);
+    close(hpipe[1]);
+    connectPipeToStdin(hpipe[0]);
     freeRedirectionTokens(i);
 }
 
@@ -479,48 +528,52 @@ static void redirectStderrAppendToFile(int i){
     freeRedirectionTokens(i);
 }
 
+static int findRedirectionHandler(const char *token){
+    static const redirection_rule rules[] = {
+        {"<", redirectInputFromFile}, {"<<", redirectInputFromHeredoc},
+        {">", redirectStdoutToFile}, {">>", redirectStdoutAppendToFile},
+        {"2>", redirectStderrToFile}, {"2>>", redirectStderrAppendToFile}
+    };
+    int idx;
+
+    for(idx = 0; idx < (int)(sizeof(rules) / sizeof(rules[0])); idx++){
+        if(strcmp(token, rules[idx].token) == 0) return idx;
+    }
+    return -1;
+}
+
+static int applyOneRedirection(int i){
+    static const redirection_rule rules[] = {
+        {"<", redirectInputFromFile}, {"<<", redirectInputFromHeredoc},
+        {">", redirectStdoutToFile}, {">>", redirectStdoutAppendToFile},
+        {"2>", redirectStderrToFile}, {"2>>", redirectStderrAppendToFile}
+    };
+    int idx;
+
+    idx = findRedirectionHandler(words[i]);
+    if(idx < 0) return 0;
+    rules[idx].handler(i);
+    return 1;
+}
+
+static void keepFilteredWord(char **filtered, int *newWords, int idx){
+    filtered[*newWords] = words[idx];
+    (*newWords)++;
+}
+
 static void applyRedirections(void){
     char **filtered;
-    int newWords = 0, i;
+    int i;
+    int newWords;
 
     filtered = malloc((nWords + 1) * sizeof(char *));
-    if(filtered == NULL){
-        perror("Error allocating filtered words");
-        exit(EXIT_FAILURE);
-    }
-
+    if(filtered == NULL){ perror("Error allocating filtered words"); exit(EXIT_FAILURE); }
     i = 0;
+    newWords = 0;
     while(i < nWords){
-        if(strcmp(words[i], "<") == 0){
-            redirectInputFromFile(i);
-            i += 2;
-
-        }else if(strcmp(words[i], "<<") == 0){
-            redirectInputFromHeredoc(i);
-            i += 2;
-
-        }else if(strcmp(words[i], ">") == 0){
-            redirectStdoutToFile(i);
-            i += 2;
-
-        }else if(strcmp(words[i], ">>") == 0){
-            redirectStdoutAppendToFile(i);
-            i += 2;
-
-        }else if(strcmp(words[i], "2>") == 0){
-            redirectStderrToFile(i);
-            i += 2;
-
-        }else if(strcmp(words[i], "2>>") == 0){
-            redirectStderrAppendToFile(i);
-            i += 2;
-
-        }else{
-            filtered[newWords++] = words[i];
-            i++;
-        }
+        if(applyOneRedirection(i)) i += 2;
+        else { keepFilteredWord(filtered, &newWords, i); i++; }
     }
-
     filtered[newWords] = NULL;
     free(words);
     words = filtered;
@@ -598,7 +651,7 @@ static int Vers(int argc, char **argv){
     return 0;
 }
 
-static int Beuip(int argc, char **argv){
+static void refreshBeuipServerPid(void){
     pid_t pid;
     int status;
 
@@ -608,6 +661,50 @@ static int Beuip(int argc, char **argv){
             beuipServerPid = -1;
         }
     }
+}
+
+static int handleBeuipStop(int argc){
+    if(argc != 2){
+        fprintf(stderr, "Usage: beuip stop\n");
+        return 1;
+    }
+    if(beuipServerPid <= 0){
+        fprintf(stderr, "beuip: no server started by this biceps instance.\n");
+        return 1;
+    }
+    return stopBeuipServer();
+}
+
+static int validateBeuipStartArgs(int argc, char **argv){
+    if(strcmp(argv[1], "start") != 0 || argc != 3) return 1;
+    if(beuipServerPid > 0){
+        fprintf(stderr, "beuip: server already running pid=%d\n", (int)beuipServerPid);
+        return 1;
+    }
+    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
+        fprintf(stderr, "beuip: invalid pseudo (1..%d chars).\n", BEUIP_MAX_PSEUDO_LEN - 1);
+        return 1;
+    }
+    return 0;
+}
+
+static int spawnBeuipServer(const char *pseudo){
+    pid_t pid;
+
+    pid = fork();
+    if(pid < 0){ perror("beuip: fork"); return 1; }
+    if(pid == 0){
+        execl("./servbeuip", "servbeuip", pseudo, (char *)NULL);
+        perror("beuip: exec ./servbeuip");
+        _exit(127);
+    }
+    beuipServerPid = pid;
+    printf("beuip: server started with pid=%d pseudo=%s\n", (int)pid, pseudo);
+    return 0;
+}
+
+static int Beuip(int argc, char **argv){
+    refreshBeuipServerPid();
 
     if(argc < 2){
         fprintf(stderr, "Usage: beuip start <pseudo> | beuip stop\n");
@@ -615,216 +712,158 @@ static int Beuip(int argc, char **argv){
     }
 
     if(strcmp(argv[1], "stop") == 0){
-        if(argc != 2){
-            fprintf(stderr, "Usage: beuip stop\n");
-            return 1;
-        }
-
-        if(beuipServerPid <= 0){
-            fprintf(stderr, "beuip: no server started by this biceps instance.\n");
-            return 1;
-        }
-
-        return stopBeuipServer();
+        return handleBeuipStop(argc);
     }
-
-    if(strcmp(argv[1], "start") != 0 || argc != 3){
+    if(validateBeuipStartArgs(argc, argv) != 0){
         fprintf(stderr, "Usage: beuip start <pseudo> | beuip stop\n");
         return 1;
     }
+    return spawnBeuipServer(argv[2]);
+}
 
-    if(beuipServerPid > 0){
-        fprintf(stderr, "beuip: server already running pid=%d\n", (int)beuipServerPid);
+static int sendBeuipStopSignal(void){
+    if(kill(beuipServerPid, SIGINT) == -1){
+        perror("beuip: kill(SIGINT)");
         return 1;
     }
+    #ifdef TRACE
+    printf("[TRACE] beuip: sent SIGINT to pid=%d\n", (int)beuipServerPid);
+    #endif
+    return 0;
+}
 
-    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
-        fprintf(stderr, "beuip: invalid pseudo (1..%d chars).\n", BEUIP_MAX_PSEUDO_LEN - 1);
+static int waitBeuipStop(void){
+    int status;
+
+    if(waitpid(beuipServerPid, &status, 0) == -1){
+        perror("beuip: waitpid");
         return 1;
     }
-
-    pid = fork();
-    if(pid < 0){
-        perror("beuip: fork");
-        return 1;
-    }
-
-    if(pid == 0){
-        execl("./servbeuip", "servbeuip", argv[2], (char *)NULL);
-        perror("beuip: exec ./servbeuip");
-        _exit(127);
-    }
-
-    beuipServerPid = pid;
-    printf("beuip: server started with pid=%d pseudo=%s\n", (int)pid, argv[2]);
     return 0;
 }
 
 static int stopBeuipServer(void){
-    int status;
-    pid_t waited;
-
-    if(beuipServerPid <= 0){
-        return 0;
-    }
-
-    if(kill(beuipServerPid, SIGINT) == -1){
-        perror("beuip: kill(SIGINT)");
+    if(beuipServerPid <= 0) return 0;
+    if(sendBeuipStopSignal() != 0 || waitBeuipStop() != 0){
         beuipServerPid = -1;
         return 1;
     }
-
-    #ifdef TRACE
-    printf("[TRACE] beuip: sent SIGINT to pid=%d\n", (int)beuipServerPid);
-    #endif
-
-    waited = waitpid(beuipServerPid, &status, 0);
-    if(waited == -1){
-        perror("beuip: waitpid");
-        beuipServerPid = -1;
-        return 1;
-    }
-
     printf("beuip: server stopped pid=%d\n", (int)beuipServerPid);
     beuipServerPid = -1;
     return 0;
 }
 
-static char *joinArgs(int start, int argc, char **argv){
+static size_t joinedArgsLength(int start, int argc, char **argv){
     int i;
-    size_t total = 1;
-    char *msg;
+    size_t total;
 
+    total = 1;
     for(i = start; i < argc; i++){
         total += strlen(argv[i]);
         if(i + 1 < argc) total += 1;
     }
+    return total;
+}
 
-    msg = malloc(total);
-    if(msg == NULL){
-        perror("mess: malloc");
-        return NULL;
-    }
+static void appendJoinedArgs(char *msg, int start, int argc, char **argv){
+    int i;
 
     msg[0] = '\0';
     for(i = start; i < argc; i++){
         strcat(msg, argv[i]);
         if(i + 1 < argc) strcat(msg, " ");
     }
+}
 
+static char *joinArgs(int start, int argc, char **argv){
+    char *msg;
+    size_t total;
+
+    total = joinedArgsLength(start, argc, argv);
+    msg = malloc(total);
+    if(msg == NULL){
+        perror("mess: malloc");
+        return NULL;
+    }
+    appendJoinedArgs(msg, start, argc, argv);
     return msg;
+}
+
+static int initMessSocketAndAddr(int *sid, struct sockaddr_in *sockServer){
+    *sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if(*sid < 0){ perror("mess: socket"); return 1; }
+    if(!creme_prepare_ipv4_addr(sockServer, MESS_SERVER_IP, BEUIP_PORT)){
+        fprintf(stderr, "mess: invalid server address: %s\n", MESS_SERVER_IP);
+        close(*sid);
+        return 1;
+    }
+    return 0;
+}
+
+static int messListCommand(int argc, int sid, const struct sockaddr_in *sockServer){
+    if(argc != 2){ fprintf(stderr, "Usage: mess list\n"); return 1; }
+    if(creme_send_list_request(sid, sockServer) == -1){
+        fprintf(stderr, "mess: failed to send list request\n");
+        return 1;
+    }
+    printf("mess: list request sent (server prints online pseudos)\n");
+    #ifdef TRACE
+    printf("[TRACE] mess list -> code=3\n");
+    #endif
+    return 0;
+}
+
+static int messUsage(void){
+    fprintf(stderr, "Usage: mess list | mess to <pseudo> <message> | mess all <message>\n");
+    return 1;
+}
+
+static int messToCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer){
+    char *msg;
+    int rc;
+
+    if(argc < 4){ fprintf(stderr, "Usage: mess to <pseudo> <message>\n"); return 1; }
+    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){ fprintf(stderr, "mess: invalid destination pseudo (1..%d chars)\n", BEUIP_MAX_PSEUDO_LEN - 1); return 1; }
+    msg = joinArgs(3, argc, argv);
+    if(msg == NULL) return 1;
+    rc = creme_send_private_message(sid, sockServer, argv[2], msg);
+    if(rc == -1){ fprintf(stderr, "mess: private message too long\n"); free(msg); return 1; }
+    printf("mess: private message sent to %s\n", argv[2]);
+    #ifdef TRACE
+    printf("[TRACE] mess to %s -> code=4 msg='%s'\n", argv[2], msg);
+    #endif
+    free(msg);
+    return 0;
+}
+
+static int messAllCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer){
+    char *msg;
+    int rc;
+
+    if(argc < 3){ fprintf(stderr, "Usage: mess all <message>\n"); return 1; }
+    msg = joinArgs(2, argc, argv);
+    if(msg == NULL) return 1;
+    rc = creme_send_broadcast_text(sid, sockServer, msg);
+    if(rc == -1){ fprintf(stderr, "mess: broadcast message too long\n"); free(msg); return 1; }
+    printf("mess: broadcast message sent\n");
+    #ifdef TRACE
+    printf("[TRACE] mess all -> code=5 msg='%s'\n", msg);
+    #endif
+    free(msg);
+    return 0;
 }
 
 static int Mess(int argc, char **argv){
     int sid;
     int rc;
     struct sockaddr_in sockServer;
-    char *msg;
 
-    if(argc < 2){
-        fprintf(stderr, "Usage: mess list | mess to <pseudo> <message> | mess all <message>\n");
-        return 1;
-    }
-
-    if((sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP)) < 0){
-        perror("mess: socket");
-        return 1;
-    }
-
-    if(!creme_prepare_ipv4_addr(&sockServer, MESS_SERVER_IP, BEUIP_PORT)){
-        fprintf(stderr, "mess: invalid server address: %s\n", MESS_SERVER_IP);
-        close(sid);
-        return 1;
-    }
-
-    if(strcmp(argv[1], "list") == 0){
-        if(argc != 2){
-            fprintf(stderr, "Usage: mess list\n");
-            close(sid);
-            return 1;
-        }
-        rc = creme_send_list_request(sid, &sockServer);
-        if(rc == -1){
-            fprintf(stderr, "mess: failed to send list request\n");
-            close(sid);
-            return 1;
-        }
-        printf("mess: list request sent (server prints online pseudos)\n");
-        #ifdef TRACE
-        printf("[TRACE] mess list -> code=3\n");
-        #endif
-        close(sid);
-        return 0;
-    }
-
-    if(strcmp(argv[1], "to") == 0){
-        if(argc < 4){
-            fprintf(stderr, "Usage: mess to <pseudo> <message>\n");
-            close(sid);
-            return 1;
-        }
-        if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
-            fprintf(stderr, "mess: invalid destination pseudo (1..%d chars)\n", BEUIP_MAX_PSEUDO_LEN - 1);
-            close(sid);
-            return 1;
-        }
-
-        msg = joinArgs(3, argc, argv);
-        if(msg == NULL){
-            close(sid);
-            return 1;
-        }
-
-        rc = creme_send_private_message(sid, &sockServer, argv[2], msg);
-        if(rc == -1){
-            fprintf(stderr, "mess: private message too long\n");
-            free(msg);
-            close(sid);
-            return 1;
-        }
-
-        printf("mess: private message sent to %s\n", argv[2]);
-        #ifdef TRACE
-        printf("[TRACE] mess to %s -> code=4 msg='%s'\n", argv[2], msg);
-        #endif
-
-        free(msg);
-        close(sid);
-        return 0;
-    }
-
-    if(strcmp(argv[1], "all") == 0){
-        if(argc < 3){
-            fprintf(stderr, "Usage: mess all <message>\n");
-            close(sid);
-            return 1;
-        }
-
-        msg = joinArgs(2, argc, argv);
-        if(msg == NULL){
-            close(sid);
-            return 1;
-        }
-
-        rc = creme_send_broadcast_text(sid, &sockServer, msg);
-        if(rc == -1){
-            fprintf(stderr, "mess: broadcast message too long\n");
-            free(msg);
-            close(sid);
-            return 1;
-        }
-
-        printf("mess: broadcast message sent\n");
-        #ifdef TRACE
-        printf("[TRACE] mess all -> code=5 msg='%s'\n", msg);
-        #endif
-
-        free(msg);
-        close(sid);
-        return 0;
-    }
-
-    fprintf(stderr, "Usage: mess list | mess to <pseudo> <message> | mess all <message>\n");
+    if(argc < 2) return messUsage();
+    if(initMessSocketAndAddr(&sid, &sockServer) != 0) return 1;
+    if(strcmp(argv[1], "list") == 0) rc = messListCommand(argc, sid, &sockServer);
+    else if(strcmp(argv[1], "to") == 0) rc = messToCommand(argc, argv, sid, &sockServer);
+    else if(strcmp(argv[1], "all") == 0) rc = messAllCommand(argc, argv, sid, &sockServer);
+    else rc = messUsage();
     close(sid);
-    return 1;
+    return rc;
 }

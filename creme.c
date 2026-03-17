@@ -54,32 +54,26 @@ int creme_copy_payload_string(const char *payload, int payloadLen, char *out, si
     return 1;
 }
 
-int creme_parse_to_pseudo_payload(const char *payload, int payloadLen,
-                                  char *pseudoDest, size_t pseudoDestSize,
-                                  char *text, size_t textSize){
+static int creme_fit_copy_len(int len, size_t size){
+    if((size_t)len >= size) return (int)size - 1;
+    return len;
+}
+
+int creme_parse_to_pseudo_payload(const char *payload, int payloadLen, char *pseudoDest,
+                                  size_t pseudoDestSize, char *text, size_t textSize){
     const char *sep;
-    int pseudoLen;
-    int textLen;
+    int pseudoLen, textLen;
 
     if(payloadLen < 3) return 0;
     sep = memchr(payload, '\0', payloadLen);
     if(sep == NULL) return 0;
-
     pseudoLen = (int)(sep - payload);
     textLen = payloadLen - pseudoLen - 1;
     if(pseudoLen <= 0 || textLen <= 0) return 0;
-
-    if((size_t)pseudoLen >= pseudoDestSize){
-        pseudoLen = (int)pseudoDestSize - 1;
-    }
-    if((size_t)textLen >= textSize){
-        textLen = (int)textSize - 1;
-    }
-
-    memcpy(pseudoDest, payload, pseudoLen);
-    pseudoDest[pseudoLen] = '\0';
-    memcpy(text, sep + 1, textLen);
-    text[textLen] = '\0';
+    pseudoLen = creme_fit_copy_len(pseudoLen, pseudoDestSize);
+    textLen = creme_fit_copy_len(textLen, textSize);
+    memcpy(pseudoDest, payload, pseudoLen); pseudoDest[pseudoLen] = '\0';
+    memcpy(text, sep + 1, textLen); text[textLen] = '\0';
     return 1;
 }
 
@@ -209,6 +203,147 @@ int creme_send_broadcast_text(int sid, const struct sockaddr_in *dest, const cha
     return creme_send_message(sid, dest, msg, len);
 }
 
+static int creme_is_local_only_code(char code){
+    return code == BEUIP_CODE_LIST || code == BEUIP_CODE_TO_PSEUDO || code == BEUIP_CODE_TO_ALL;
+}
+
+static int creme_invalid_payload(char code, unsigned int remoteIpHost){
+    fprintf(stderr, "[CODE %c] FROM: %s | STATUS: INVALID PAYLOAD\n",
+            code, creme_addrip(remoteIpHost));
+    return 1;
+}
+
+static int creme_refuse_non_local(char code, unsigned int remoteIpHost){
+    if(!creme_is_local_only_code(code) || remoteIpHost == INADDR_LOOPBACK) return 0;
+    fprintf(stderr, "[CODE %c] FROM: %s | STATUS: REFUSED (non-local source)\n",
+            code, creme_addrip(remoteIpHost));
+    return 1;
+}
+
+static void creme_fill_sockaddr(struct sockaddr_in *sockDest, unsigned int ip){
+    memset(sockDest, 0, sizeof(*sockDest));
+    sockDest->sin_family = AF_INET;
+    sockDest->sin_port = htons(BEUIP_PORT);
+    sockDest->sin_addr.s_addr = htonl(ip);
+}
+
+static int creme_build_text_datagram(const char *text, char *outMsg, size_t outSize){
+    int outLen;
+
+    outLen = creme_build_message(BEUIP_CODE_TEXT, text, outMsg, outSize);
+    if(outLen < 0) fprintf(stderr, "message code=9 too long\n");
+    return outLen;
+}
+
+static int creme_send_text_datagram(int sid, unsigned int ip, const char *outMsg, int outLen, const char *label){
+    struct sockaddr_in sockDest;
+
+    creme_fill_sockaddr(&sockDest, ip);
+    if(sendto(sid, outMsg, outLen, MSG_CONFIRM, (const struct sockaddr *)&sockDest, sizeof(sockDest)) == -1){
+        perror(label);
+        return 1;
+    }
+    return 0;
+}
+
+static int creme_handle_leave(creme_peer_table *table, unsigned int remoteIpHost,
+                              const char *payload, int payloadLen){
+    char pseudo[BEUIP_MAX_PSEUDO_LEN];
+
+    if(!creme_copy_payload_string(payload, payloadLen, pseudo, sizeof(pseudo))) return creme_invalid_payload(BEUIP_CODE_LEAVE, remoteIpHost);
+    creme_remove_peer(table, remoteIpHost, pseudo);
+    printf("[CODE 0] FROM: %s | EVENT: LEAVE | PSEUDO: %s\n", creme_addrip(remoteIpHost), pseudo);
+    return 1;
+}
+
+static int creme_handle_list(const creme_peer_table *table, unsigned int remoteIpHost, int payloadLen){
+    if(payloadLen != 0) return creme_invalid_payload(BEUIP_CODE_LIST, remoteIpHost);
+    printf("[CODE 3] FROM: %s | EVENT: LIST REQUEST\n", creme_addrip(remoteIpHost));
+    creme_print_peer_list(table);
+    return 1;
+}
+
+static int creme_handle_private(int sid, const creme_peer_table *table, unsigned int remoteIpHost,
+                                const char *payload, int payloadLen){
+    char pseudoDest[BEUIP_MAX_PSEUDO_LEN];
+    char text[BEUIP_LBUF + 1];
+    char outMsg[BEUIP_LBUF + 1];
+    int outLen;
+    int idx;
+
+    if(!creme_parse_to_pseudo_payload(payload, payloadLen, pseudoDest, sizeof(pseudoDest), text, sizeof(text))) return creme_invalid_payload(BEUIP_CODE_TO_PSEUDO, remoteIpHost);
+    idx = creme_find_peer_by_pseudo(table, pseudoDest);
+    if(idx < 0){ fprintf(stderr, "[CODE 4] FROM: %s | STATUS: DEST NOT FOUND | TO: %s\n", creme_addrip(remoteIpHost), pseudoDest); return 1; }
+    outLen = creme_build_text_datagram(text, outMsg, sizeof(outMsg));
+    if(outLen < 0) return 1;
+    if(creme_send_text_datagram(sid, table->entries[idx].ip, outMsg, outLen, "sendto code=9") != 0) return 1;
+    printf("[CODE 4] FROM: %s | TO: %s | MSG: %s\n", creme_addrip(remoteIpHost), pseudoDest, text);
+    return 1;
+}
+
+static void creme_broadcast_to_peers(int sid, const creme_peer_table *table,
+                                     const char *selfPseudo, const char *outMsg, int outLen){
+    int i;
+
+    for(i = 0; i < table->count; i++){
+        if(strcmp(table->entries[i].pseudo, selfPseudo) == 0) continue;
+        creme_send_text_datagram(sid, table->entries[i].ip, outMsg, outLen,
+                                 "sendto code=9 (broadcast msg)");
+    }
+}
+
+static int creme_handle_all(int sid, const creme_peer_table *table, const char *selfPseudo,
+                            unsigned int remoteIpHost, const char *payload, int payloadLen){
+    char text[BEUIP_LBUF + 1];
+    char outMsg[BEUIP_LBUF + 1];
+    int outLen;
+
+    if(!creme_copy_payload_string(payload, payloadLen, text, sizeof(text))) return creme_invalid_payload(BEUIP_CODE_TO_ALL, remoteIpHost);
+    outLen = creme_build_text_datagram(text, outMsg, sizeof(outMsg));
+    if(outLen < 0) return 1;
+    creme_broadcast_to_peers(sid, table, selfPseudo, outMsg, outLen);
+    printf("[CODE 5] FROM: %s | TO: ALL | MSG: %s\n", creme_addrip(remoteIpHost), text);
+    return 1;
+}
+
+static int creme_handle_text(const creme_peer_table *table, unsigned int remoteIpHost,
+                             const char *payload, int payloadLen){
+    char text[BEUIP_LBUF + 1];
+    int idx;
+
+    idx = creme_find_peer_by_ip(table, remoteIpHost);
+    if(!creme_copy_payload_string(payload, payloadLen, text, sizeof(text))) return creme_invalid_payload(BEUIP_CODE_TEXT, remoteIpHost);
+    if(idx < 0){ fprintf(stderr, "[CODE 9] FROM: %s | STATUS: UNKNOWN SOURCE | MSG: %s\n", creme_addrip(remoteIpHost), text); return 1; }
+    printf("[CODE 9] FROM: %s (%s) | MSG: %s\n", table->entries[idx].pseudo, creme_addrip(remoteIpHost), text);
+    return 1;
+}
+
+static int creme_send_ack(int sid, const char *selfPseudo, const struct sockaddr_in *remote, socklen_t remoteLen){
+    char outMsg[BEUIP_LBUF + 1];
+    int outLen;
+
+    outLen = creme_build_message(BEUIP_CODE_ACK, selfPseudo, outMsg, sizeof(outMsg));
+    if(outLen < 0){ fprintf(stderr, "ACK not sent: message too long\n"); return 1; }
+    if(sendto(sid, outMsg, outLen, MSG_CONFIRM, (const struct sockaddr *)remote, remoteLen) == -1) perror("sendto ack");
+    return 1;
+}
+
+static int creme_handle_peer_code(int sid, const char *selfPseudo, creme_peer_table *table,
+                                  const struct sockaddr_in *remote, socklen_t remoteLen,
+                                  unsigned int remoteIpHost, char code,
+                                  const char *payload, int payloadLen){
+    char pseudo[BEUIP_MAX_PSEUDO_LEN];
+
+    if(!creme_copy_payload_string(payload, payloadLen, pseudo, sizeof(pseudo))) return creme_invalid_payload(code, remoteIpHost);
+    if(creme_add_peer(table, remoteIpHost, pseudo) < 0){
+        fprintf(stderr, "Peer table full (%d). Ignoring %s/%s\n", BEUIP_MAX_PEERS, creme_addrip(remoteIpHost), pseudo);
+        return 1;
+    }
+    printf("[CODE %c] FROM: %s | PSEUDO: %s\n", code, creme_addrip(remoteIpHost), pseudo);
+    if(code == BEUIP_CODE_BROADCAST) return creme_send_ack(sid, selfPseudo, remote, remoteLen);
+    return 1;
+}
+
 int creme_handle_server_datagram(int sid, const char *selfPseudo, creme_peer_table *table,
                                  const struct sockaddr_in *remote, socklen_t remoteLen,
                                  const char *buf, int n){
@@ -216,170 +351,16 @@ int creme_handle_server_datagram(int sid, const char *selfPseudo, creme_peer_tab
     char code;
     const char *payload;
     int payloadLen;
-    char pseudo[BEUIP_MAX_PSEUDO_LEN];
-    char pseudoDest[BEUIP_MAX_PSEUDO_LEN];
-    char text[BEUIP_LBUF + 1];
-    char outMsg[BEUIP_LBUF + 1];
-    int outLen;
-    int idx;
-    struct sockaddr_in sockDest;
 
     remoteIpHost = ntohl(remote->sin_addr.s_addr);
-
-    if(!creme_parse_header(buf, n, &code, &payload, &payloadLen)){
-        return 0;
-    }
-
-    if((code == BEUIP_CODE_LIST || code == BEUIP_CODE_TO_PSEUDO || code == BEUIP_CODE_TO_ALL) &&
-       remoteIpHost != INADDR_LOOPBACK){
-        fprintf(stderr, "[CODE %c] FROM: %s | STATUS: REFUSED (non-local source)\n",
-                code, creme_addrip(remoteIpHost));
-        return 1;
-    }
-
-    if(code == BEUIP_CODE_LEAVE){
-        if(!creme_copy_payload_string(payload, payloadLen, pseudo, sizeof(pseudo))){
-            fprintf(stderr, "[CODE 0] FROM: %s | STATUS: INVALID PAYLOAD\n",
-                    creme_addrip(remoteIpHost));
-            return 1;
-        }
-        creme_remove_peer(table, remoteIpHost, pseudo);
-        printf("[CODE 0] FROM: %s | EVENT: LEAVE | PSEUDO: %s\n",
-               creme_addrip(remoteIpHost), pseudo);
-        return 1;
-    }
-
-    if(code == BEUIP_CODE_LIST){
-        if(payloadLen != 0){
-            fprintf(stderr, "[CODE 3] FROM: %s | STATUS: INVALID PAYLOAD\n",
-                    creme_addrip(remoteIpHost));
-            return 1;
-        }
-        printf("[CODE 3] FROM: %s | EVENT: LIST REQUEST\n",
-               creme_addrip(remoteIpHost));
-        creme_print_peer_list(table);
-        return 1;
-    }
-
-    if(code == BEUIP_CODE_TO_PSEUDO){
-        if(!creme_parse_to_pseudo_payload(payload, payloadLen,
-                                          pseudoDest, sizeof(pseudoDest),
-                                          text, sizeof(text))){
-            fprintf(stderr, "[CODE 4] FROM: %s | STATUS: INVALID PAYLOAD\n",
-                    creme_addrip(remoteIpHost));
-            return 1;
-        }
-
-        idx = creme_find_peer_by_pseudo(table, pseudoDest);
-        if(idx < 0){
-            fprintf(stderr, "[CODE 4] FROM: %s | STATUS: DEST NOT FOUND | TO: %s\n",
-                    creme_addrip(remoteIpHost), pseudoDest);
-            return 1;
-        }
-
-        outLen = creme_build_message(BEUIP_CODE_TEXT, text, outMsg, sizeof(outMsg));
-        if(outLen < 0){
-            fprintf(stderr, "message code=9 too long\n");
-            return 1;
-        }
-
-        memset(&sockDest, 0, sizeof(sockDest));
-        sockDest.sin_family = AF_INET;
-        sockDest.sin_port = htons(BEUIP_PORT);
-        sockDest.sin_addr.s_addr = htonl(table->entries[idx].ip);
-
-        if(sendto(sid, outMsg, outLen, MSG_CONFIRM,
-                  (const struct sockaddr *)&sockDest, sizeof(sockDest)) == -1){
-            perror("sendto code=9");
-            return 1;
-        }
-
-        printf("[CODE 4] FROM: %s | TO: %s | MSG: %s\n",
-               creme_addrip(remoteIpHost), pseudoDest, text);
-        return 1;
-    }
-
-    if(code == BEUIP_CODE_TO_ALL){
-        int i;
-
-        if(!creme_copy_payload_string(payload, payloadLen, text, sizeof(text))){
-            fprintf(stderr, "[CODE 5] FROM: %s | STATUS: INVALID PAYLOAD\n",
-                    creme_addrip(remoteIpHost));
-            return 1;
-        }
-
-        outLen = creme_build_message(BEUIP_CODE_TEXT, text, outMsg, sizeof(outMsg));
-        if(outLen < 0){
-            fprintf(stderr, "message code=9 too long\n");
-            return 1;
-        }
-
-        for(i = 0; i < table->count; i++){
-            if(strcmp(table->entries[i].pseudo, selfPseudo) == 0) continue;
-
-            memset(&sockDest, 0, sizeof(sockDest));
-            sockDest.sin_family = AF_INET;
-            sockDest.sin_port = htons(BEUIP_PORT);
-            sockDest.sin_addr.s_addr = htonl(table->entries[i].ip);
-
-            if(sendto(sid, outMsg, outLen, MSG_CONFIRM,
-                      (const struct sockaddr *)&sockDest, sizeof(sockDest)) == -1){
-                perror("sendto code=9 (broadcast msg)");
-            }
-        }
-
-        printf("[CODE 5] FROM: %s | TO: ALL | MSG: %s\n",
-               creme_addrip(remoteIpHost), text);
-        return 1;
-    }
-
-    if(code == BEUIP_CODE_TEXT){
-        idx = creme_find_peer_by_ip(table, remoteIpHost);
-        if(!creme_copy_payload_string(payload, payloadLen, text, sizeof(text))){
-            fprintf(stderr, "[CODE 9] FROM: %s | STATUS: INVALID PAYLOAD\n",
-                    creme_addrip(remoteIpHost));
-            return 1;
-        }
-        if(idx < 0){
-            fprintf(stderr, "[CODE 9] FROM: %s | STATUS: UNKNOWN SOURCE | MSG: %s\n",
-                    creme_addrip(remoteIpHost), text);
-            return 1;
-        }
-
-        printf("[CODE 9] FROM: %s (%s) | MSG: %s\n",
-               table->entries[idx].pseudo, creme_addrip(remoteIpHost), text);
-        return 1;
-    }
-
-    if(!creme_copy_payload_string(payload, payloadLen, pseudo, sizeof(pseudo))){
-        fprintf(stderr, "[CODE %c] FROM: %s | STATUS: INVALID PAYLOAD\n",
-                code, creme_addrip(remoteIpHost));
-        return 1;
-    }
-
-    if(creme_add_peer(table, remoteIpHost, pseudo) < 0){
-        fprintf(stderr, "Peer table full (%d). Ignoring %s/%s\n",
-                BEUIP_MAX_PEERS, creme_addrip(remoteIpHost), pseudo);
-        return 1;
-    }
-
-    printf("[CODE %c] FROM: %s | PSEUDO: %s\n",
-           code, creme_addrip(remoteIpHost), pseudo);
-
-    if(code == BEUIP_CODE_BROADCAST){
-        outLen = creme_build_message(BEUIP_CODE_ACK, selfPseudo, outMsg, sizeof(outMsg));
-        if(outLen < 0){
-            fprintf(stderr, "ACK not sent: message too long\n");
-            return 1;
-        }
-
-        if(sendto(sid, outMsg, outLen, MSG_CONFIRM,
-                  (const struct sockaddr *)remote, remoteLen) == -1){
-            perror("sendto ack");
-        }
-    }
-
-    return 1;
+    if(!creme_parse_header(buf, n, &code, &payload, &payloadLen)) return 0;
+    if(creme_refuse_non_local(code, remoteIpHost)) return 1;
+    if(code == BEUIP_CODE_LEAVE) return creme_handle_leave(table, remoteIpHost, payload, payloadLen);
+    if(code == BEUIP_CODE_LIST) return creme_handle_list(table, remoteIpHost, payloadLen);
+    if(code == BEUIP_CODE_TO_PSEUDO) return creme_handle_private(sid, table, remoteIpHost, payload, payloadLen);
+    if(code == BEUIP_CODE_TO_ALL) return creme_handle_all(sid, table, selfPseudo, remoteIpHost, payload, payloadLen);
+    if(code == BEUIP_CODE_TEXT) return creme_handle_text(table, remoteIpHost, payload, payloadLen);
+    return creme_handle_peer_code(sid, selfPseudo, table, remote, remoteLen, remoteIpHost, code, payload, payloadLen);
 }
 
 void creme_init_peer_table(creme_peer_table *table){

@@ -10,83 +10,109 @@
 
 #define BICEPS_VERSION "2.0"
 
-char *buildPrompt(void);
-void intHandler(int s);
+static char *buildPrompt(void);
+static void intHandler(int s);
+static void initShell(void);
+static void maybeAddHistory(const char *line);
+static void runShellLoop(const char *prompt);
+static const char *getUserName(void);
+static void getMachineName(char *machine, size_t machineSize);
+static char *createPrompt(const char *user, const char *machine, const char *suffix);
 
 int main(int argc, char *argv[]){    
-    char *prompt, *line, *historyPath;
-    HIST_ENTRY *last;
+    char *prompt, *historyPath;
 
-
-    signal(SIGINT, intHandler);
-
-    updateComInt(BICEPS_VERSION);
-    listComInt();
+    (void)argc;
+    (void)argv;
+    initShell();
 
     historyPath = getHistoryPath();
     stifle_history(HISTORY_SIZE);
     read_history(historyPath);
-
     prompt = buildPrompt();
-
-    while(1){
-        line = readline(prompt);
-
-        if(line == NULL){
-            printf("Exiting biceps shell. Goodbye!\n");
-            break;
-        }
-
-        if(*line != '\0'){
-            last = history_length > 0 ? history_get(history_base + history_length - 1) : NULL;
-            if(last == NULL || strcmp(last->line, line) != 0){
-                add_history(line);
-            }
-            execLine(line);
-        }
-        free(line);
-    }
-
+    runShellLoop(prompt);
     write_history(historyPath);
     free(historyPath);
-
     free(prompt);
     return 0;
 }
 
-char *buildPrompt(void){
-    char *user;
-    char machine[256];
-    char *prompt;
-    int len;
+static void initShell(void){
+    signal(SIGINT, intHandler);
+    updateComInt(BICEPS_VERSION);
+    listComInt();
+}
+
+static void maybeAddHistory(const char *line){
+    HIST_ENTRY *last;
+
+    last = history_length > 0 ? history_get(history_base + history_length - 1) : NULL;
+    if(last == NULL || strcmp(last->line, line) != 0){
+        add_history(line);
+    }
+}
+
+static void runShellLoop(const char *prompt){
+    char *line;
+
+    while(1){
+        line = readline(prompt);
+        if(line == NULL){
+            printf("Exiting biceps shell. Goodbye!\n");
+            break;
+        }
+        if(*line != '\0'){
+            maybeAddHistory(line);
+            execLine(line);
+        }
+        free(line);
+    }
+}
+
+static const char *getUserName(void){
+    const char *user;
 
     user = getenv("USER");
     if(user == NULL){
         fprintf(stderr, "Error: USER environment variable not set.\n");
         exit(EXIT_FAILURE);
     }
+    return user;
+}
 
-    if(gethostname(machine, sizeof(machine)) != 0){
+static void getMachineName(char *machine, size_t machineSize){
+    if(gethostname(machine, machineSize) != 0){
         perror("Error getting hostname");
         exit(EXIT_FAILURE);
     }
+}
 
-    const char *sufix = (getuid() == 0) ? "#" : "$";
+static char *createPrompt(const char *user, const char *machine, const char *suffix){
+    char *prompt;
+    int len;
 
-    // utilisateur@machine + sufix + ' ' + '\0'
-    len = strlen(user) + 1 + strlen(machine) + strlen(sufix) + 2;
+    len = strlen(user) + 1 + strlen(machine) + strlen(suffix) + 2;
     prompt = malloc(len);
     if(prompt == NULL){
         perror("Error allocating memory for prompt");
         exit(EXIT_FAILURE);
     }
-
-    snprintf(prompt, len, "%s@%s%s ", user, machine, sufix);
-
+    snprintf(prompt, len, "%s@%s%s ", user, machine, suffix);
     return prompt;
 }
 
-void intHandler(int s){
+static char *buildPrompt(void){
+    char machine[256];
+    const char *user;
+    const char *suffix;
+
+    user = getUserName();
+    getMachineName(machine, sizeof(machine));
+    suffix = (getuid() == 0) ? "#" : "$";
+    return createPrompt(user, machine, suffix);
+}
+
+static void intHandler(int s){
     (void)s;
     printf("\n");
     rl_on_new_line();

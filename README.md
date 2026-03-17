@@ -1,15 +1,28 @@
 # UNIX SHELL - biceps
 
-`biceps` is a Unix shell written in C for an Operating Systems course.
-It now includes:
-- Shell core (`biceps` + `gescom`)
-- Network module (`creme`)
+`biceps` is a Unix shell written in C for an Operating Systems course with integrated BEUIP network protocol support. It includes:
+- Interactive shell core (`biceps` + `gescom`)
+- Reusable network/BEUIP library (`creme`)
 - BEUIP protocol server/client (`servbeuip`, `clibeuip`)
-- Internal shell commands to control and use BEUIP from inside `biceps`
+- Internal shell commands to manage and use BEUIP from within `biceps`
 
 ---
 
-## Implemented Features
+---
+
+## Implementation Summary
+
+This project implements a full-featured Unix shell with integrated peer-to-peer networking:
+
+**Shell Core**: Interactive command interpreter with pipes, redirections, and history
+**Networking**: Custom BEUIP protocol (broadcast, discovery, private messaging) integrated into shell
+**Code Quality**: All functions refactored and maintained under 20-line limit with strict `-Wall -Werror` compilation
+
+Key work completed:
+- Refactored monolithic functions into focused helpers
+- Each function has single responsibility (e.g., parsing, validation, socket handling)
+- Protocol handlers organized by message type
+- Build validated with strict compiler flags
 
 ### Shell (`biceps` / `gescom`)
 - Interactive prompt: `user@machine$` (or `#` for root)
@@ -65,49 +78,75 @@ Payload by code:
 
 ---
 
-## Project Files
+## Code Structure
 
-```text
-.
-├── biceps.c       # shell main loop and prompt
-├── gescom.c       # command engine and internal commands
-├── gescom.h
-├── creme.c        # reusable BEUIP/network logic
-├── creme.h
-├── servbeuip.c    # BEUIP server executable
-├── clibeuip.c     # BEUIP test client executable
-├── servudp.c      # basic UDP server example
-├── cliudp.c       # basic UDP client example
-├── triceps.c      # minimal reference shell
-└── Makefile
-```
+### Module Architecture
 
-Versioned components used by `biceps`:
-- `biceps` shell: `v1.0`
-- `gescom` module: `v1.2`
-- `creme` module: `v1.0`
+**Shell (`biceps` + `gescom`)**:
+- `biceps.c` (≈40 lines): Main REPL loop, prompt display, interactive session management
+- `gescom.c/h` (≈400 lines): Command parser, execution engine, internal command handlers
+  - Parses user input into tokens and redirections
+  - Routes to built-in commands (`cd`, `pwd`, `vers`, `beuip`, `mess`) or external executables
+  - Manages pipes and I/O redirections (dup2-based redirection)
+  - Integrated BEUIP client commands (`mess list`, `mess to`, `mess all`)
+
+**Network Core (`creme`)**:
+- `creme.c/h` (≈500 lines): Reusable BEUIP protocol library
+  - Message building/parsing functions
+  - UDP socket management (broadcast enable, binding)
+  - Peer table (IP + pseudo tuple management with duplicate prevention)
+  - Server-side datagram dispatch router (delegates to message-type handlers)
+
+**BEUIP Server (`servbeuip`)**:
+- `servbeuip.c` (≈14 lines main): UDP server for peer discovery and message broadcast
+  - Listens for peer presence announcements and routes messages between peers
+  - Maintains active peer list with IP/pseudo tracking
+  - Handles message codes: presence (1), ACK (2), list (3), private (4), broadcast (5), leave (0)
+  - Security: codes 3/4/5 accepted only from localhost (127.0.0.1)
+
+**BEUIP Client Test (`clibeuip`)**:
+- `clibeuip.c` (≈14 lines main): Standalone client for protocol testing
+  - Can broadcast presence, query peer list, send private/public messages, signal leave
+
+### Design Decisions
+
+1. **Function Size Constraint**: All functions refactored to < 20 lines for improved:
+   - Readability and maintainability
+   - Testability and debugging
+   - Code reuse through helper composition
+
+2. **Strict Compilation** (`-Wall -Werror`): All warnings treated as errors
+   - Catches bugs early
+   - Ensures code quality
+
+3. **Modular Helpers**: Large functions decomposed into single-responsibility helpers:
+   - Example: Server datagram handling split into type-specific message handlers
+   - Command execution split into parsing, validation, and dispatch stages
 
 ---
 
-## Build
+## Build & Compilation
 
-Requirements:
+**Requirements:**
 - `gcc`
-- `libreadline-dev`
+- `libreadline-dev` (for shell history/editing)
 
-Install readline (Debian/Ubuntu):
+**Install readline (Debian/Ubuntu):**
 ```bash
 sudo apt install libreadline-dev
 ```
 
+**Compiler flags:**
+- `-Wall -Werror`: Enable all warnings and treat as errors
+- `-g -DTRACE` (debug variant): Enable debug symbols and trace messages
+
 Common targets:
 ```bash
-make udp          # build servudp + cliudp
 make beuip        # build servbeuip + clibeuip
-make biceps       # build shell
+make biceps       # build shell (primary deliverable)
 make biceps-debug # build with -DTRACE and debug symbols
-make biceps-valgrind
-make clean
+make biceps-valgrind  # run shell under Valgrind
+make clean        # remove all build artifacts
 ```
 
 ---
@@ -130,14 +169,17 @@ beuip stop
 exit
 ```
 
-Standalone BEUIP test:
+Standalone BEUIP test (without shell):
 ```bash
+# Terminal 1:
 ./servbeuip matheus
-./clibeuip alice
-./clibeuip 3
-./clibeuip 4 alice "hello"
-./clibeuip 5 "hello all"
-./clibeuip 0 alice
+
+# Terminal 2:
+./clibeuip alice           # broadcast presence
+./clibeuip 3              # list online peers
+./clibeuip 4 alice "hello"  # private message
+./clibeuip 5 "hello all"  # message to all
+./clibeuip 0 alice        # leave
 ```
 
 ---
