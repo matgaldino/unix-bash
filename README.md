@@ -15,8 +15,8 @@
 This project implements a full-featured Unix shell with integrated peer-to-peer networking:
 
 **Shell Core**: Interactive command interpreter with pipes, redirections, and history
-**Networking**: Custom BEUIP protocol (broadcast, discovery, private messaging) integrated into shell
-**Code Quality**: All functions refactored and maintained under 20-line limit with strict `-Wall -Werror` compilation
+**Networking**: Custom BEUIP protocol (broadcast, discovery, messaging, file sharing) integrated into shell
+**Code Quality**: All functions maintained under 20-line limit with strict `-Wall -Werror` compilation
 
 Key work completed:
 - Refactored monolithic functions into focused helpers
@@ -58,23 +58,37 @@ Key work completed:
 - `creme`
 - `biceps`
 
+### Biceps v3 — Multi-threading and File Sharing (TP3)
+- **UDP server replaced by a POSIX thread** (`serveur_udp`): shares memory with the shell process, eliminating the need for self-sent UDP messages and closing the man-in-the-middle vulnerability
+- **Codes 3/4/5 removed from UDP**: handled directly in-process via `commande()` using the shared peer list — security hardening
+- **Mutex-protected peer list**: concurrent access between the UDP thread (writes) and the shell thread (reads) guarded by `pthread_mutex_t`
+- **Automatic broadcast address detection**: `getifaddrs()` + `getnameinfo()` enumerate all active interfaces at startup, replacing the hardcoded `192.168.88.255`
+- **Peer list replaced by ordered linked list** (`struct elt`): alphabetically sorted by pseudo, dynamically allocated, replaces the fixed-size `creme_peer_table`
+- **TCP server thread** (`serveur_tcp`): listens on port `9998`, spawns one detached thread per connection
+- **`beuip ls <pseudo>`**: connects via TCP to a peer and retrieves its `reppub/` listing (`ls -l`)
+- **`beuip get <pseudo> <nomfic>`**: downloads a file from a peer's `reppub/` over TCP with security checks (no `/`, no `..`, no overwrite of existing local file, remote error detection)
+- **Multi-level trace compilation**: `TRACE1` (server lifecycle + protocol events), `TRACE2` (execution flow details); `-DTRACE` enables all levels
+
 ---
 
 ## BEUIP Message Format
 
 Message structure:
-- Byte 1: code (`'0'`, `'1'`, `'2'`, `'3'`, `'4'`, `'5'`, `'9'`)
+- Byte 1: code (`'0'`, `'1'`, `'2'`, `'9'`)
 - Bytes 2-6: literal tag `BEUIP`
 - Bytes 7-end: payload
 
 Payload by code:
 - `0`: pseudo leaving
-- `1`: pseudo (presence)
+- `1`: pseudo (presence broadcast)
 - `2`: pseudo (ACK)
-- `3`: empty
-- `4`: `destPseudo\0message`
-- `5`: message text
 - `9`: message text
+
+> Codes `3`, `4`, `5` are no longer transmitted over UDP (biceps v3). They are handled internally via `commande()`.
+
+### TCP File Sharing Protocol (port 9998)
+- Client sends `L` → server replies with `ls -l reppub/` output then closes
+- Client sends `F<nomfic>\n` → server replies with `cat reppub/<nomfic>` output then closes
 
 ---
 
@@ -84,29 +98,26 @@ Payload by code:
 
 **Shell (`biceps` + `gescom`)**:
 - `biceps.c` (≈40 lines): Main REPL loop, prompt display, interactive session management
-- `gescom.c/h` (≈400 lines): Command parser, execution engine, internal command handlers
+- `gescom.c/h` (≈1300 lines): Command parser, execution engine, all internal command handlers
   - Parses user input into tokens and redirections
   - Routes to built-in commands (`cd`, `pwd`, `vers`, `beuip`, `mess`) or external executables
   - Manages pipes and I/O redirections (dup2-based redirection)
-  - Integrated BEUIP client commands (`mess list`, `mess to`, `mess all`)
+  - UDP thread: `serveur_udp`, datagram handlers, presence broadcast via `getifaddrs`
+  - TCP thread: `serveur_tcp`, `envoiListe`, `envoiFichier`, per-connection thread dispatch
+  - Peer list: `struct elt` linked list with `ajouteElt`, `supprimeElt`, `listeElts`, `findIpByPseudo`
+  - Client commands: `demandeListe`, `demandeFichier`, `commande`
 
 **Network Core (`creme`)**:
 - `creme.c/h` (≈500 lines): Reusable BEUIP protocol library
   - Message building/parsing functions
   - UDP socket management (broadcast enable, binding)
-  - Peer table (IP + pseudo tuple management with duplicate prevention)
   - Server-side datagram dispatch router (delegates to message-type handlers)
 
 **BEUIP Server (`servbeuip`)**:
-- `servbeuip.c` (≈14 lines main): UDP server for peer discovery and message broadcast
-  - Listens for peer presence announcements and routes messages between peers
-  - Maintains active peer list with IP/pseudo tracking
-  - Handles message codes: presence (1), ACK (2), list (3), private (4), broadcast (5), leave (0)
-  - Security: codes 3/4/5 accepted only from localhost (127.0.0.1)
+- `servbeuip.c` (≈14 lines main): Standalone UDP server (TP1/TP2 reference implementation)
 
 **BEUIP Client Test (`clibeuip`)**:
 - `clibeuip.c` (≈14 lines main): Standalone client for protocol testing
-  - Can broadcast presence, query peer list, send private/public messages, signal leave
 
 ### Design Decisions
 
@@ -161,11 +172,13 @@ Start shell:
 Inside `biceps`:
 ```text
 vers
-beuip start matheus
-mess list
-mess to alice hello alice
-mess all hello everyone
-beuip stop
+beuip start matheus reppub      # starts UDP + TCP servers
+mess list                        # list online peers
+mess to alice hello alice        # private message
+mess all hello everyone          # broadcast message
+beuip ls alice                   # list alice's shared files
+beuip get alice report.pdf       # download file from alice
+beuip stop                       # graceful shutdown
 exit
 ```
 
@@ -186,9 +199,14 @@ Standalone BEUIP test (without shell):
 
 ## TRACE Mode
 
-Compile with TRACE enabled:
-```bash
-make biceps-debug
-```
+Two levels of conditional trace messages, enabled at compile time:
 
-This enables conditional debug messages guarded by `#ifdef TRACE`.
+| Flag | Messages included |
+|---|---|
+| `-DTRACE1` | Server thread lifecycle, protocol code events (`[CODE 1/2]`), security rejections |
+| `-DTRACE2` | Execution flow: fork/exec, pipe children, broadcast addresses |
+| `-DTRACE` | All levels (master switch, equivalent to `TRACE1` + `TRACE2`) |
+
+```bash
+make biceps-debug        # builds with -DTRACE (all levels) + debug symbols
+```

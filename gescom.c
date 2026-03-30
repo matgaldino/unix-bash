@@ -11,11 +11,22 @@
 #include<pthread.h>
 #include<ifaddrs.h>
 #include<netdb.h>
+#include<stdint.h>
+#include<sys/select.h>
 #include "gescom.h"
 #include "creme.h"
 
 #define GESCOM_VERSION "2.0"
 #define LPSEUDO 23
+
+#ifdef TRACE
+#ifndef TRACE1
+#define TRACE1
+#endif
+#ifndef TRACE2
+#define TRACE2
+#endif
+#endif
 
 struct elt {
     char nom[LPSEUDO + 1];
@@ -28,9 +39,11 @@ static char *shell_version = "unknown";
 static char **words;
 static int nWords;
 static pthread_t g_beuipThread;
+static pthread_t g_beuipTcpThread;
 static volatile int g_beuipRunning = 0;
 static volatile int g_stopUdp = 0;
 static char g_pseudo[BEUIP_MAX_PSEUDO_LEN];
+static char g_reppub[512];
 static struct elt *g_list = NULL;
 static pthread_mutex_t g_peers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
@@ -92,6 +105,22 @@ static void handleCodeText(const char *payload, int payloadLen, const char *remo
 static void udpHandleDatagram(int sid, const char *pseudo, char *buf, int n, struct sockaddr_in *sockRemote, socklen_t ls);
 static void udpRunLoop(int sid, const char *pseudo);
 static void *serveur_udp(void *p);
+static int tcpSetupSocket(void);
+static int tcpAcceptWithTimeout(int sid, int timeoutSec);
+static void envoiListe(int fd);
+static int readFilename(int fd, char *nom, size_t size);
+static void envoiFichier(int fd);
+static void envoiContenu(int fd);
+static void *handleConnection(void *arg);
+static void *serveur_tcp(void *rep);
+static int tcpConnectTo(const char *adip);
+static void recvAndPrint(int fd);
+static void demandeListe(char *pseudo);
+static int validateNomfic(const char *nomfic);
+static int localFileExists(const char *nomfic);
+static int saveToFile(int fd, const char *nomfic);
+static void doGetFile(const char *adip, const char *nomfic);
+static void demandeFichier(char *pseudo, char *nomfic);
 static int eltExists(const char *pseudo, const char *adip);
 static void insertElt(struct elt *newElt, const char *pseudo);
 static void ajouteElt(char *pseudo, char *adip);
@@ -107,7 +136,7 @@ static void commandeAll(const char *message);
 static void commande(char octet1, char *message, char *pseudo);
 static int handleBeuipStop(int argc);
 static int validateBeuipStartArgs(int argc, char **argv);
-static int spawnBeuipServer(const char *pseudo);
+static int spawnBeuipServer(int argc, char **argv);
 static int stopBeuipServer(void);
 static int Mess(int argc, char **argv);
 static int messUsage(void);
@@ -236,8 +265,8 @@ static int execComInt(int argc, char **argv){
 
 static void runExternalChild(char **argv){
     (void)argv;
-    #ifdef TRACE
-        printf("[TRACE] child pid=%d executing: %s\n", getpid(), words[0]);
+    #ifdef TRACE2
+        printf("[TRACE2] child pid=%d executing: %s\n", getpid(), words[0]);
     #endif
     applyRedirections();
     execvp(words[0], words);
@@ -248,12 +277,12 @@ static void runExternalChild(char **argv){
 static int waitExternalChild(pid_t pid){
     int status;
 
-    #ifdef TRACE
-        printf("[TRACE] parent pid=%d waiting for child pid=%d\n", getpid(), pid);
+    #ifdef TRACE2
+        printf("[TRACE2] parent pid=%d waiting for child pid=%d\n", getpid(), pid);
     #endif
     waitpid(pid, &status, 0);
-    #ifdef TRACE
-        printf("[TRACE] child exited with status %d\n", WEXITSTATUS(status));
+    #ifdef TRACE2
+        printf("[TRACE2] child exited with status %d\n", WEXITSTATUS(status));
     #endif
     return WEXITSTATUS(status);
 }
@@ -288,8 +317,8 @@ void execLine(char *line){
     copy = dupLineOrExit(line, "Error duplicating line for command execution");
     aux = copy;
     while((cmd = strsep(&aux, ";")) != NULL){
-        #ifdef TRACE
-            printf("[TRACE] execLine: sub-command: '%s'\n", cmd);
+        #ifdef TRACE2
+            printf("[TRACE2] execLine: sub-command: '%s'\n", cmd);
         #endif
         if(strchr(cmd, '|') != NULL){
             execPipe(cmd);
@@ -369,8 +398,8 @@ static void runPipeChild(int idx, int nCommands, int pipes[][2], char *cmd){
     closePipeArray(pipes, nCommands - 1);
     if(analyseCom(cmd) == 0) exit(0);
     applyRedirections();
-    #ifdef TRACE
-        printf("[TRACE] pipe: filho %d executando: %s\n", idx, words[0]);
+    #ifdef TRACE2
+        printf("[TRACE2] pipe: filho %d executando: %s\n", idx, words[0]);
     #endif
     if(!execComInt(nWords, words)) execvp(words[0], words);
     fprintf(stderr, "%s: command not found\n", words[0]);
@@ -399,8 +428,8 @@ static void waitPipeChildren(pid_t pids[], int nCommands){
 
         if(pids[i] == -1) continue;
         waitpid(pids[i], &status, 0);
-        #ifdef TRACE
-            printf("[TRACE] pipe: filho %d terminou com status %d\n", i, WEXITSTATUS(status));
+        #ifdef TRACE2
+            printf("[TRACE2] pipe: filho %d terminou com status %d\n", i, WEXITSTATUS(status));
         #endif
     }
 }
@@ -709,8 +738,8 @@ static void sendToIfaBroadcast(int sid, struct ifaddrs *ifa, const char *msg, in
     if(strcmp(host, "127.0.0.1") == 0) return;
     if(!creme_prepare_ipv4_addr(&dest, host, BEUIP_PORT)) return;
     sendto(sid, msg, len, 0, (struct sockaddr *)&dest, sizeof(dest));
-    #ifdef TRACE
-    printf("[TRACE] broadcast sent to %s\n", host);
+    #ifdef TRACE2
+    printf("[TRACE2] broadcast sent to %s\n", host);
     #endif
 }
 
@@ -767,7 +796,9 @@ static void handleCodeAnnounce(int sid, const char *selfPseudo, char code,
 
     if(!creme_copy_payload_string(payload, payloadLen, nom, sizeof(nom))) return;
     ajouteElt(nom, (char *)remoteAdip);
-    printf("[CODE %c] FROM: %s | PSEUDO: %s\n", code, remoteAdip, nom);
+    #ifdef TRACE1
+    printf("[TRACE1][CODE %c] FROM: %s | PSEUDO: %s\n", code, remoteAdip, nom);
+    #endif
     if(code != BEUIP_CODE_BROADCAST) return;
     ackLen = creme_build_message(BEUIP_CODE_ACK, selfPseudo, ackMsg, sizeof(ackMsg));
     if(ackLen > 0) sendto(sid, ackMsg, ackLen, 0, (const struct sockaddr *)remote, ls);
@@ -792,7 +823,12 @@ static void udpHandleDatagram(int sid, const char *pseudo, char *buf, int n,
     char remoteAdip[16];
     unsigned int ip;
 
-    if(!isServerCode(buf[0])){ fprintf(stderr, "[SECURITY] Rejected code '%c'\n", buf[0]); return; }
+    if(!isServerCode(buf[0])){
+        #ifdef TRACE1
+        fprintf(stderr, "[TRACE1][SECURITY] Rejected code '%c'\n", buf[0]);
+        #endif
+        return;
+    }
     if(!creme_parse_header(buf, n, &code, &payload, &payloadLen)) return;
     ip = ntohl(sockRemote->sin_addr.s_addr);
     snprintf(remoteAdip, sizeof(remoteAdip), "%u.%u.%u.%u",
@@ -826,13 +862,137 @@ static void *serveur_udp(void *p){
     clearList();
     sid = udpSetupSocket();
     if(sid < 0){ g_beuipRunning = 0; return NULL; }
-    printf("[SERVER] BEUIP thread listening on UDP %d | pseudo=%s\n", BEUIP_PORT, pseudo);
+    #ifdef TRACE1
+    printf("[TRACE1][SERVER] BEUIP thread listening on UDP %d | pseudo=%s\n", BEUIP_PORT, pseudo);
+    #endif
     sendPresenceAll(sid, pseudo);
     udpRunLoop(sid, pseudo);
     sendLeaveAll(sid, pseudo);
     close(sid);
-    printf("[SERVER] BEUIP thread stopped\n");
+    #ifdef TRACE1
+    printf("[TRACE1][SERVER] BEUIP thread stopped\n");
+    #endif
     g_beuipRunning = 0;
+    return NULL;
+}
+
+static int tcpSetupSocket(void){
+    int sid, yes = 1;
+    struct sockaddr_in addr;
+
+    sid = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(sid < 0){ perror("serveur_tcp: socket"); return -1; }
+    setsockopt(sid, SOL_SOCKET, SO_REUSEADDR, &yes, sizeof(yes));
+    memset(&addr, 0, sizeof(addr));
+    addr.sin_family = AF_INET;
+    addr.sin_port = htons(BEUIP_PORT);
+    addr.sin_addr.s_addr = htonl(INADDR_ANY);
+    if(bind(sid, (struct sockaddr *)&addr, sizeof(addr)) < 0){ perror("serveur_tcp: bind"); close(sid); return -1; }
+    if(listen(sid, 5) < 0){ perror("serveur_tcp: listen"); close(sid); return -1; }
+    return sid;
+}
+
+static int tcpAcceptWithTimeout(int sid, int timeoutSec){
+    fd_set fds;
+    struct timeval tv;
+
+    FD_ZERO(&fds);
+    FD_SET(sid, &fds);
+    tv.tv_sec = timeoutSec;
+    tv.tv_usec = 0;
+    if(select(sid + 1, &fds, NULL, NULL, &tv) <= 0) return -1;
+    return accept(sid, NULL, NULL);
+}
+
+static void envoiListe(int fd){
+    char path[1024];
+    pid_t pid;
+
+    snprintf(path, sizeof(path), "%s/", g_reppub);
+    pid = fork();
+    if(pid < 0){ perror("envoiListe: fork"); return; }
+    if(pid == 0){
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        execlp("ls", "ls", "-l", path, (char *)NULL);
+        _exit(1);
+    }
+    waitpid(pid, NULL, 0);
+}
+
+static int readFilename(int fd, char *nom, size_t size){
+    size_t i = 0;
+    char c;
+
+    while(i < size - 1){
+        if(read(fd, &c, 1) != 1) break;
+        if(c == '\n') break;
+        nom[i++] = c;
+    }
+    nom[i] = '\0';
+    return (i > 0) ? 0 : -1;
+}
+
+static void envoiFichier(int fd){
+    char nom[256], path[1024];
+    pid_t pid;
+
+    if(readFilename(fd, nom, sizeof(nom)) < 0) return;
+    snprintf(path, sizeof(path), "%s/%s", g_reppub, nom);
+    pid = fork();
+    if(pid < 0){ perror("envoiFichier: fork"); return; }
+    if(pid == 0){
+        dup2(fd, STDOUT_FILENO);
+        dup2(fd, STDERR_FILENO);
+        execlp("cat", "cat", path, (char *)NULL);
+        _exit(1);
+    }
+    waitpid(pid, NULL, 0);
+}
+
+static void envoiContenu(int fd){
+    char byte;
+
+    if(read(fd, &byte, 1) != 1) return;
+    if(byte == 'L'){ envoiListe(fd); return; }
+    if(byte == 'F'){ envoiFichier(fd); return; }
+    #ifdef TRACE1
+    fprintf(stderr, "[TRACE1][TCP] Unknown request: '%c'\n", byte);
+    #endif
+}
+
+static void *handleConnection(void *arg){
+    int fd = (int)(intptr_t)arg;
+
+    envoiContenu(fd);
+    close(fd);
+    return NULL;
+}
+
+static void *serveur_tcp(void *rep){
+    int sid, fd;
+    pthread_t tid;
+
+    (void)rep;
+    sid = tcpSetupSocket();
+    if(sid < 0) return NULL;
+    #ifdef TRACE1
+    printf("[TRACE1][SERVER] TCP thread listening on TCP %d | reppub=%s\n", BEUIP_PORT, g_reppub);
+    #endif
+    while(!g_stopUdp){
+        fd = tcpAcceptWithTimeout(sid, 1);
+        if(fd < 0) continue;
+        if(pthread_create(&tid, NULL, handleConnection, (void *)(intptr_t)fd) != 0){
+            perror("serveur_tcp: pthread_create");
+            close(fd);
+        } else {
+            pthread_detach(tid);
+        }
+    }
+    close(sid);
+    #ifdef TRACE1
+    printf("[TRACE1][SERVER] TCP thread stopped\n");
+    #endif
     return NULL;
 }
 
@@ -849,11 +1009,8 @@ static int handleBeuipStop(int argc){
 }
 
 static int validateBeuipStartArgs(int argc, char **argv){
-    if(strcmp(argv[1], "start") != 0 || argc != 3) return 1;
-    if(g_beuipRunning){
-        fprintf(stderr, "beuip: server already running\n");
-        return 1;
-    }
+    if(strcmp(argv[1], "start") != 0 || argc < 3 || argc > 4) return 1;
+    if(g_beuipRunning){ fprintf(stderr, "beuip: server already running\n"); return 1; }
     if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
         fprintf(stderr, "beuip: invalid pseudo (1..%d chars).\n", BEUIP_MAX_PSEUDO_LEN - 1);
         return 1;
@@ -861,40 +1018,172 @@ static int validateBeuipStartArgs(int argc, char **argv){
     return 0;
 }
 
-static int spawnBeuipServer(const char *pseudo){
+static int spawnBeuipServer(int argc, char **argv){
+    const char *pseudo = argv[2];
+    const char *reppub = (argc >= 4) ? argv[3] : "reppub";
+
     strncpy(g_pseudo, pseudo, BEUIP_MAX_PSEUDO_LEN - 1);
     g_pseudo[BEUIP_MAX_PSEUDO_LEN - 1] = '\0';
+    strncpy(g_reppub, reppub, sizeof(g_reppub) - 1);
+    g_reppub[sizeof(g_reppub) - 1] = '\0';
     g_stopUdp = 0;
     g_beuipRunning = 1;
     if(pthread_create(&g_beuipThread, NULL, serveur_udp, g_pseudo) != 0){
-        perror("beuip: pthread_create");
-        g_beuipRunning = 0;
-        return 1;
+        perror("beuip: pthread_create UDP"); g_beuipRunning = 0; return 1;
     }
-    printf("beuip: server thread started | pseudo=%s\n", pseudo);
+    if(pthread_create(&g_beuipTcpThread, NULL, serveur_tcp, g_reppub) != 0){
+        perror("beuip: pthread_create TCP");
+        g_stopUdp = 1; pthread_join(g_beuipThread, NULL); g_beuipRunning = 0; return 1;
+    }
+    printf("beuip: servers started | pseudo=%s reppub=%s\n", pseudo, reppub);
     return 0;
+}
+
+static int tcpConnectTo(const char *adip){
+    int fd;
+    struct sockaddr_in dest;
+
+    fd = socket(AF_INET, SOCK_STREAM, IPPROTO_TCP);
+    if(fd < 0){ perror("tcpConnectTo: socket"); return -1; }
+    if(!creme_prepare_ipv4_addr(&dest, adip, BEUIP_PORT)){ close(fd); return -1; }
+    if(connect(fd, (struct sockaddr *)&dest, sizeof(dest)) < 0){
+        perror("tcpConnectTo: connect"); close(fd); return -1;
+    }
+    return fd;
+}
+
+static void recvAndPrint(int fd){
+    char buf[512];
+    int n;
+
+    while((n = read(fd, buf, sizeof(buf))) > 0)
+        write(STDOUT_FILENO, buf, n);
+}
+
+static void demandeListe(char *pseudo){
+    char adip[16];
+    int fd;
+
+    pthread_mutex_lock(&g_peers_mutex);
+    if(findIpByPseudo(pseudo, adip, sizeof(adip)) < 0){
+        pthread_mutex_unlock(&g_peers_mutex);
+        fprintf(stderr, "beuip ls: pseudo '%s' not found\n", pseudo);
+        return;
+    }
+    pthread_mutex_unlock(&g_peers_mutex);
+    fd = tcpConnectTo(adip);
+    if(fd < 0) return;
+    write(fd, "L", 1);
+    recvAndPrint(fd);
+    close(fd);
+}
+
+static int validateNomfic(const char *nomfic){
+    if(nomfic == NULL || nomfic[0] == '\0'){
+        fprintf(stderr, "beuip get: empty filename\n");
+        return -1;
+    }
+    if(strchr(nomfic, '/') != NULL){
+        fprintf(stderr, "beuip get: filename must not contain '/'\n");
+        return -1;
+    }
+    if(strcmp(nomfic, "..") == 0){
+        fprintf(stderr, "beuip get: filename must not be '..'\n");
+        return -1;
+    }
+    return 0;
+}
+
+static int localFileExists(const char *nomfic){
+    char path[1024];
+    const char *rep = g_reppub[0] ? g_reppub : "reppub";
+
+    snprintf(path, sizeof(path), "%s/%s", rep, nomfic);
+    return access(path, F_OK) == 0;
+}
+
+static int saveToFile(int fd, const char *nomfic){
+    char path[1024];
+    char buf[4096];
+    const char *rep = g_reppub[0] ? g_reppub : "reppub";
+    int n, outfd;
+
+    n = read(fd, buf, sizeof(buf) - 1);
+    if(n <= 0) return -1;
+    buf[n] = '\0';
+    if(strncmp(buf, "cat: ", 5) == 0){
+        fprintf(stderr, "beuip get: remote error: %s", buf);
+        return -1;
+    }
+    snprintf(path, sizeof(path), "%s/%s", rep, nomfic);
+    outfd = open(path, O_WRONLY | O_CREAT | O_EXCL, 0644);
+    if(outfd < 0){ perror("beuip get: open"); return -1; }
+    write(outfd, buf, n);
+    while((n = read(fd, buf, sizeof(buf))) > 0) write(outfd, buf, n);
+    close(outfd);
+    printf("beuip get: saved to %s\n", path);
+    return 0;
+}
+
+static void doGetFile(const char *adip, const char *nomfic){
+    int fd;
+    char msg[LPSEUDO + 4];
+
+    fd = tcpConnectTo(adip);
+    if(fd < 0) return;
+    snprintf(msg, sizeof(msg), "F%s\n", nomfic);
+    write(fd, msg, strlen(msg));
+    saveToFile(fd, nomfic);
+    close(fd);
+}
+
+static void demandeFichier(char *pseudo, char *nomfic){
+    char adip[16];
+
+    if(validateNomfic(nomfic) < 0) return;
+    if(localFileExists(nomfic)){
+        fprintf(stderr, "beuip get: '%s' already exists locally\n", nomfic);
+        return;
+    }
+    pthread_mutex_lock(&g_peers_mutex);
+    if(findIpByPseudo(pseudo, adip, sizeof(adip)) < 0){
+        pthread_mutex_unlock(&g_peers_mutex);
+        fprintf(stderr, "beuip get: pseudo '%s' not found\n", pseudo);
+        return;
+    }
+    pthread_mutex_unlock(&g_peers_mutex);
+    doGetFile(adip, nomfic);
 }
 
 static int Beuip(int argc, char **argv){
     if(argc < 2){
-        fprintf(stderr, "Usage: beuip start <pseudo> | beuip stop\n");
+        fprintf(stderr, "Usage: beuip start <pseudo> [reppub] | beuip stop | beuip ls <pseudo> | beuip get <pseudo> <nomfic>\n");
         return 1;
     }
-    if(strcmp(argv[1], "stop") == 0){
-        return handleBeuipStop(argc);
+    if(strcmp(argv[1], "stop") == 0) return handleBeuipStop(argc);
+    if(strcmp(argv[1], "ls") == 0){
+        if(argc != 3){ fprintf(stderr, "Usage: beuip ls <pseudo>\n"); return 1; }
+        demandeListe(argv[2]);
+        return 0;
+    }
+    if(strcmp(argv[1], "get") == 0){
+        if(argc != 4){ fprintf(stderr, "Usage: beuip get <pseudo> <nomfic>\n"); return 1; }
+        demandeFichier(argv[2], argv[3]);
+        return 0;
     }
     if(validateBeuipStartArgs(argc, argv) != 0){
-        fprintf(stderr, "Usage: beuip start <pseudo> | beuip stop\n");
+        fprintf(stderr, "Usage: beuip start <pseudo> [reppub] | beuip stop | beuip ls <pseudo> | beuip get <pseudo> <nomfic>\n");
         return 1;
     }
-    return spawnBeuipServer(argv[2]);
+    return spawnBeuipServer(argc, argv);
 }
 
 static int stopBeuipServer(void){
     if(!g_beuipRunning) return 0;
     g_stopUdp = 1;
     pthread_join(g_beuipThread, NULL);
-    printf("beuip: server thread stopped\n");
+    pthread_join(g_beuipTcpThread, NULL);
+    printf("beuip: servers stopped\n");
     return 0;
 }
 
