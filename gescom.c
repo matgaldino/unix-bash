@@ -7,16 +7,22 @@
 #include<signal.h>
 #include<readline/history.h>
 #include<fcntl.h>
+#include<errno.h>
+#include<pthread.h>
 #include "gescom.h"
 #include "creme.h"
 
-#define GESCOM_VERSION "1.2"
-#define MESS_SERVER_IP "127.0.0.1"
+#define GESCOM_VERSION "1.3"
 static char *shell_version = "unknown";
 
 static char **words;
 static int nWords;
-static pid_t beuipServerPid = -1;
+static pthread_t g_beuipThread;
+static volatile int g_beuipRunning = 0;
+static volatile int g_stopUdp = 0;
+static char g_pseudo[BEUIP_MAX_PSEUDO_LEN];
+static creme_peer_table g_peers;
+static pthread_mutex_t g_peers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static comInt tabCom[NBMAXC];
 static int nCom = 0;
@@ -64,22 +70,28 @@ static int Cd(int argc, char **argv);
 static int Pwd(int argc, char **argv);
 static int Vers(int argc, char **argv);
 static int Beuip(int argc, char **argv);
-static void refreshBeuipServerPid(void);
+static int udpSetupSocket(struct sockaddr_in *sockBroadcast);
+static int isServerCode(char code);
+static void udpHandleDatagram(int sid, const char *pseudo, char *buf, int n, struct sockaddr_in *sockRemote, socklen_t ls);
+static void udpRunLoop(int sid, const char *pseudo);
+static void *serveur_udp(void *p);
+static int sendTextToIp(unsigned int ipHost, const char *text);
+static void commandeList(void);
+static void commandeToPseudo(const char *pseudo, const char *message);
+static void commandeAll(const char *message);
+static void commande(char octet1, char *message, char *pseudo);
 static int handleBeuipStop(int argc);
 static int validateBeuipStartArgs(int argc, char **argv);
 static int spawnBeuipServer(const char *pseudo);
-static int sendBeuipStopSignal(void);
-static int waitBeuipStop(void);
+static int stopBeuipServer(void);
 static int Mess(int argc, char **argv);
 static int messUsage(void);
+static int messListCommand(int argc);
+static int messToCommand(int argc, char **argv);
+static int messAllCommand(int argc, char **argv);
 static char *joinArgs(int start, int argc, char **argv);
 static size_t joinedArgsLength(int start, int argc, char **argv);
 static void appendJoinedArgs(char *msg, int start, int argc, char **argv);
-static int initMessSocketAndAddr(int *sid, struct sockaddr_in *sockServer);
-static int messListCommand(int argc, int sid, const struct sockaddr_in *sockServer);
-static int messToCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer);
-static int messAllCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer);
-static int stopBeuipServer(void);
 
 static char *dupLineOrExit(const char *src, const char *context){
     char *copy;
@@ -591,7 +603,7 @@ static int Exit(int argc, char **argv){
     write_history(historyPath);
     free(historyPath);
 
-    if(beuipServerPid > 0){
+    if(g_beuipRunning){
         stopBeuipServer();
     }
 
@@ -651,16 +663,65 @@ static int Vers(int argc, char **argv){
     return 0;
 }
 
-static void refreshBeuipServerPid(void){
-    pid_t pid;
-    int status;
+static int udpSetupSocket(struct sockaddr_in *sockBroadcast){
+    int sid;
 
-    if(beuipServerPid > 0){
-        pid = waitpid(beuipServerPid, &status, WNOHANG);
-        if(pid == beuipServerPid){
-            beuipServerPid = -1;
-        }
+    sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if(sid < 0){ perror("serveur_udp: socket"); return -1; }
+    if(creme_enable_broadcast(sid) == -1){ perror("serveur_udp: broadcast"); close(sid); return -1; }
+    if(creme_enable_recv_timeout(sid, 1) == -1){ perror("serveur_udp: timeout"); close(sid); return -1; }
+    if(creme_bind_any(sid, BEUIP_PORT) == -1){ perror("serveur_udp: bind"); close(sid); return -1; }
+    if(!creme_prepare_ipv4_addr(sockBroadcast, BEUIP_BROADCAST_IP, BEUIP_PORT)){ close(sid); return -1; }
+    return sid;
+}
+
+static int isServerCode(char code){
+    return code == BEUIP_CODE_LEAVE || code == BEUIP_CODE_BROADCAST ||
+           code == BEUIP_CODE_ACK  || code == BEUIP_CODE_TEXT;
+}
+
+static void udpHandleDatagram(int sid, const char *pseudo, char *buf, int n,
+                               struct sockaddr_in *sockRemote, socklen_t ls){
+    if(!isServerCode(buf[0])){
+        fprintf(stderr, "[SECURITY] Rejected code '%c'\n", buf[0]);
+        return;
     }
+    pthread_mutex_lock(&g_peers_mutex);
+    creme_handle_server_datagram(sid, pseudo, &g_peers, sockRemote, ls, buf, n);
+    pthread_mutex_unlock(&g_peers_mutex);
+}
+
+static void udpRunLoop(int sid, const char *pseudo){
+    char buf[BEUIP_LBUF + 1];
+    struct sockaddr_in sockRemote;
+    socklen_t ls;
+    int n;
+
+    while(!g_stopUdp){
+        ls = sizeof(sockRemote);
+        n = recvfrom(sid, buf, BEUIP_LBUF, 0, (struct sockaddr *)&sockRemote, &ls);
+        if(n < 0) continue;
+        buf[n] = '\0';
+        udpHandleDatagram(sid, pseudo, buf, n, &sockRemote, ls);
+    }
+}
+
+static void *serveur_udp(void *p){
+    const char *pseudo = (const char *)p;
+    struct sockaddr_in sockBroadcast;
+    int sid;
+
+    creme_init_peer_table(&g_peers);
+    sid = udpSetupSocket(&sockBroadcast);
+    if(sid < 0){ g_beuipRunning = 0; return NULL; }
+    printf("[SERVER] BEUIP thread listening on UDP %d | pseudo=%s\n", BEUIP_PORT, pseudo);
+    creme_send_presence(sid, &sockBroadcast, pseudo);
+    udpRunLoop(sid, pseudo);
+    creme_send_leave(sid, &sockBroadcast, pseudo);
+    close(sid);
+    printf("[SERVER] BEUIP thread stopped\n");
+    g_beuipRunning = 0;
+    return NULL;
 }
 
 static int handleBeuipStop(int argc){
@@ -668,8 +729,8 @@ static int handleBeuipStop(int argc){
         fprintf(stderr, "Usage: beuip stop\n");
         return 1;
     }
-    if(beuipServerPid <= 0){
-        fprintf(stderr, "beuip: no server started by this biceps instance.\n");
+    if(!g_beuipRunning){
+        fprintf(stderr, "beuip: no server running.\n");
         return 1;
     }
     return stopBeuipServer();
@@ -677,8 +738,8 @@ static int handleBeuipStop(int argc){
 
 static int validateBeuipStartArgs(int argc, char **argv){
     if(strcmp(argv[1], "start") != 0 || argc != 3) return 1;
-    if(beuipServerPid > 0){
-        fprintf(stderr, "beuip: server already running pid=%d\n", (int)beuipServerPid);
+    if(g_beuipRunning){
+        fprintf(stderr, "beuip: server already running\n");
         return 1;
     }
     if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
@@ -689,28 +750,24 @@ static int validateBeuipStartArgs(int argc, char **argv){
 }
 
 static int spawnBeuipServer(const char *pseudo){
-    pid_t pid;
-
-    pid = fork();
-    if(pid < 0){ perror("beuip: fork"); return 1; }
-    if(pid == 0){
-        execl("./servbeuip", "servbeuip", pseudo, (char *)NULL);
-        perror("beuip: exec ./servbeuip");
-        _exit(127);
+    strncpy(g_pseudo, pseudo, BEUIP_MAX_PSEUDO_LEN - 1);
+    g_pseudo[BEUIP_MAX_PSEUDO_LEN - 1] = '\0';
+    g_stopUdp = 0;
+    g_beuipRunning = 1;
+    if(pthread_create(&g_beuipThread, NULL, serveur_udp, g_pseudo) != 0){
+        perror("beuip: pthread_create");
+        g_beuipRunning = 0;
+        return 1;
     }
-    beuipServerPid = pid;
-    printf("beuip: server started with pid=%d pseudo=%s\n", (int)pid, pseudo);
+    printf("beuip: server thread started | pseudo=%s\n", pseudo);
     return 0;
 }
 
 static int Beuip(int argc, char **argv){
-    refreshBeuipServerPid();
-
     if(argc < 2){
         fprintf(stderr, "Usage: beuip start <pseudo> | beuip stop\n");
         return 1;
     }
-
     if(strcmp(argv[1], "stop") == 0){
         return handleBeuipStop(argc);
     }
@@ -721,36 +778,66 @@ static int Beuip(int argc, char **argv){
     return spawnBeuipServer(argv[2]);
 }
 
-static int sendBeuipStopSignal(void){
-    if(kill(beuipServerPid, SIGINT) == -1){
-        perror("beuip: kill(SIGINT)");
-        return 1;
-    }
-    #ifdef TRACE
-    printf("[TRACE] beuip: sent SIGINT to pid=%d\n", (int)beuipServerPid);
-    #endif
-    return 0;
-}
-
-static int waitBeuipStop(void){
-    int status;
-
-    if(waitpid(beuipServerPid, &status, 0) == -1){
-        perror("beuip: waitpid");
-        return 1;
-    }
-    return 0;
-}
-
 static int stopBeuipServer(void){
-    if(beuipServerPid <= 0) return 0;
-    if(sendBeuipStopSignal() != 0 || waitBeuipStop() != 0){
-        beuipServerPid = -1;
-        return 1;
-    }
-    printf("beuip: server stopped pid=%d\n", (int)beuipServerPid);
-    beuipServerPid = -1;
+    if(!g_beuipRunning) return 0;
+    g_stopUdp = 1;
+    pthread_join(g_beuipThread, NULL);
+    printf("beuip: server thread stopped\n");
     return 0;
+}
+
+static int sendTextToIp(unsigned int ipHost, const char *text){
+    struct sockaddr_in dest;
+    char msg[BEUIP_LBUF + 1];
+    int sid, len;
+
+    sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
+    if(sid < 0){ perror("commande: socket"); return -1; }
+    memset(&dest, 0, sizeof(dest));
+    dest.sin_family = AF_INET;
+    dest.sin_port = htons(BEUIP_PORT);
+    dest.sin_addr.s_addr = htonl(ipHost);
+    len = creme_build_message(BEUIP_CODE_TEXT, text, msg, sizeof(msg));
+    if(len < 0){ close(sid); return -1; }
+    sendto(sid, msg, len, 0, (struct sockaddr *)&dest, sizeof(dest));
+    close(sid);
+    return 0;
+}
+
+static void commandeList(void){
+    pthread_mutex_lock(&g_peers_mutex);
+    creme_print_peer_list(&g_peers);
+    pthread_mutex_unlock(&g_peers_mutex);
+}
+
+static void commandeToPseudo(const char *pseudo, const char *message){
+    int idx;
+    unsigned int ip;
+
+    pthread_mutex_lock(&g_peers_mutex);
+    idx = creme_find_peer_by_pseudo(&g_peers, pseudo);
+    if(idx >= 0) ip = g_peers.entries[idx].ip;
+    pthread_mutex_unlock(&g_peers_mutex);
+    if(idx < 0){ fprintf(stderr, "mess: pseudo '%s' not found\n", pseudo); return; }
+    sendTextToIp(ip, message);
+}
+
+static void commandeAll(const char *message){
+    unsigned int ips[BEUIP_MAX_PEERS];
+    int i, count;
+
+    pthread_mutex_lock(&g_peers_mutex);
+    count = g_peers.count;
+    for(i = 0; i < count; i++) ips[i] = g_peers.entries[i].ip;
+    pthread_mutex_unlock(&g_peers_mutex);
+    for(i = 0; i < count; i++) sendTextToIp(ips[i], message);
+}
+
+static void commande(char octet1, char *message, char *pseudo){
+    if(octet1 == BEUIP_CODE_LIST){ commandeList(); return; }
+    if(octet1 == BEUIP_CODE_TO_PSEUDO){ commandeToPseudo(pseudo, message); return; }
+    if(octet1 == BEUIP_CODE_TO_ALL){ commandeAll(message); return; }
+    fprintf(stderr, "commande: unknown code '%c'\n", octet1);
 }
 
 static size_t joinedArgsLength(int start, int argc, char **argv){
@@ -789,81 +876,47 @@ static char *joinArgs(int start, int argc, char **argv){
     return msg;
 }
 
-static int initMessSocketAndAddr(int *sid, struct sockaddr_in *sockServer){
-    *sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
-    if(*sid < 0){ perror("mess: socket"); return 1; }
-    if(!creme_prepare_ipv4_addr(sockServer, MESS_SERVER_IP, BEUIP_PORT)){
-        fprintf(stderr, "mess: invalid server address: %s\n", MESS_SERVER_IP);
-        close(*sid);
-        return 1;
-    }
-    return 0;
-}
-
-static int messListCommand(int argc, int sid, const struct sockaddr_in *sockServer){
-    if(argc != 2){ fprintf(stderr, "Usage: mess list\n"); return 1; }
-    if(creme_send_list_request(sid, sockServer) == -1){
-        fprintf(stderr, "mess: failed to send list request\n");
-        return 1;
-    }
-    printf("mess: list request sent (server prints online pseudos)\n");
-    #ifdef TRACE
-    printf("[TRACE] mess list -> code=3\n");
-    #endif
-    return 0;
-}
-
 static int messUsage(void){
     fprintf(stderr, "Usage: mess list | mess to <pseudo> <message> | mess all <message>\n");
     return 1;
 }
 
-static int messToCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer){
+static int messListCommand(int argc){
+    if(argc != 2){ fprintf(stderr, "Usage: mess list\n"); return 1; }
+    commande(BEUIP_CODE_LIST, NULL, NULL);
+    return 0;
+}
+
+static int messToCommand(int argc, char **argv){
     char *msg;
-    int rc;
 
     if(argc < 4){ fprintf(stderr, "Usage: mess to <pseudo> <message>\n"); return 1; }
-    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){ fprintf(stderr, "mess: invalid destination pseudo (1..%d chars)\n", BEUIP_MAX_PSEUDO_LEN - 1); return 1; }
+    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
+        fprintf(stderr, "mess: invalid pseudo (1..%d chars)\n", BEUIP_MAX_PSEUDO_LEN - 1);
+        return 1;
+    }
     msg = joinArgs(3, argc, argv);
     if(msg == NULL) return 1;
-    rc = creme_send_private_message(sid, sockServer, argv[2], msg);
-    if(rc == -1){ fprintf(stderr, "mess: private message too long\n"); free(msg); return 1; }
-    printf("mess: private message sent to %s\n", argv[2]);
-    #ifdef TRACE
-    printf("[TRACE] mess to %s -> code=4 msg='%s'\n", argv[2], msg);
-    #endif
+    commande(BEUIP_CODE_TO_PSEUDO, msg, argv[2]);
     free(msg);
     return 0;
 }
 
-static int messAllCommand(int argc, char **argv, int sid, const struct sockaddr_in *sockServer){
+static int messAllCommand(int argc, char **argv){
     char *msg;
-    int rc;
 
     if(argc < 3){ fprintf(stderr, "Usage: mess all <message>\n"); return 1; }
     msg = joinArgs(2, argc, argv);
     if(msg == NULL) return 1;
-    rc = creme_send_broadcast_text(sid, sockServer, msg);
-    if(rc == -1){ fprintf(stderr, "mess: broadcast message too long\n"); free(msg); return 1; }
-    printf("mess: broadcast message sent\n");
-    #ifdef TRACE
-    printf("[TRACE] mess all -> code=5 msg='%s'\n", msg);
-    #endif
+    commande(BEUIP_CODE_TO_ALL, msg, NULL);
     free(msg);
     return 0;
 }
 
 static int Mess(int argc, char **argv){
-    int sid;
-    int rc;
-    struct sockaddr_in sockServer;
-
     if(argc < 2) return messUsage();
-    if(initMessSocketAndAddr(&sid, &sockServer) != 0) return 1;
-    if(strcmp(argv[1], "list") == 0) rc = messListCommand(argc, sid, &sockServer);
-    else if(strcmp(argv[1], "to") == 0) rc = messToCommand(argc, argv, sid, &sockServer);
-    else if(strcmp(argv[1], "all") == 0) rc = messAllCommand(argc, argv, sid, &sockServer);
-    else rc = messUsage();
-    close(sid);
-    return rc;
+    if(strcmp(argv[1], "list") == 0) return messListCommand(argc);
+    if(strcmp(argv[1], "to") == 0) return messToCommand(argc, argv);
+    if(strcmp(argv[1], "all") == 0) return messAllCommand(argc, argv);
+    return messUsage();
 }

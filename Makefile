@@ -15,7 +15,7 @@ clibeuip : clibeuip.c creme.h creme.o
 	$(CC) $(CFLAGS) -o clibeuip clibeuip.c creme.o
 
 biceps: biceps.o gescom.o creme.o
-	$(CC) $(CFLAGS) -o biceps biceps.o gescom.o creme.o $(READLINE_LIB)
+	$(CC) $(CFLAGS) -o biceps biceps.o gescom.o creme.o $(READLINE_LIB) -lpthread
 
 biceps.o: biceps.c gescom.h
 	$(CC) $(CFLAGS) -o biceps.o -c biceps.c
@@ -24,7 +24,7 @@ gescom.o: gescom.c gescom.h creme.h
 	$(CC) $(CFLAGS) -o gescom.o -c gescom.c
 
 biceps-debug: biceps.c gescom.c creme.c gescom.h creme.h
-	$(CC) $(DEBUG_CFLAGS) -o biceps-debug biceps.c gescom.c creme.c $(READLINE_LIB)
+	$(CC) $(DEBUG_CFLAGS) -o biceps-debug biceps.c gescom.c creme.c $(READLINE_LIB) -lpthread
 
 biceps-valgrind: biceps-debug
 	valgrind --leak-check=full ./biceps-debug
