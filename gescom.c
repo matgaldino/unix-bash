@@ -9,10 +9,20 @@
 #include<fcntl.h>
 #include<errno.h>
 #include<pthread.h>
+#include<ifaddrs.h>
+#include<netdb.h>
 #include "gescom.h"
 #include "creme.h"
 
-#define GESCOM_VERSION "1.3"
+#define GESCOM_VERSION "2.0"
+#define LPSEUDO 23
+
+struct elt {
+    char nom[LPSEUDO + 1];
+    char adip[16];
+    struct elt *next;
+};
+
 static char *shell_version = "unknown";
 
 static char **words;
@@ -21,7 +31,7 @@ static pthread_t g_beuipThread;
 static volatile int g_beuipRunning = 0;
 static volatile int g_stopUdp = 0;
 static char g_pseudo[BEUIP_MAX_PSEUDO_LEN];
-static creme_peer_table g_peers;
+static struct elt *g_list = NULL;
 static pthread_mutex_t g_peers_mutex = PTHREAD_MUTEX_INITIALIZER;
 
 static comInt tabCom[NBMAXC];
@@ -70,12 +80,27 @@ static int Cd(int argc, char **argv);
 static int Pwd(int argc, char **argv);
 static int Vers(int argc, char **argv);
 static int Beuip(int argc, char **argv);
-static int udpSetupSocket(struct sockaddr_in *sockBroadcast);
+static int udpSetupSocket(void);
+static void sendToIfaBroadcast(int sid, struct ifaddrs *ifa, const char *msg, int len);
+static void broadcastToAll(int sid, const char *msg, int len);
+static void sendPresenceAll(int sid, const char *pseudo);
+static void sendLeaveAll(int sid, const char *pseudo);
 static int isServerCode(char code);
+static void handleCodeLeave(const char *payload, int payloadLen, const char *remoteAdip);
+static void handleCodeAnnounce(int sid, const char *selfPseudo, char code, const char *payload, int payloadLen, const char *remoteAdip, const struct sockaddr_in *remote, socklen_t ls);
+static void handleCodeText(const char *payload, int payloadLen, const char *remoteAdip);
 static void udpHandleDatagram(int sid, const char *pseudo, char *buf, int n, struct sockaddr_in *sockRemote, socklen_t ls);
 static void udpRunLoop(int sid, const char *pseudo);
 static void *serveur_udp(void *p);
-static int sendTextToIp(unsigned int ipHost, const char *text);
+static int eltExists(const char *pseudo, const char *adip);
+static void insertElt(struct elt *newElt, const char *pseudo);
+static void ajouteElt(char *pseudo, char *adip);
+static void supprimeElt(char *adip);
+static void listeElts(void);
+static void clearList(void);
+static int findIpByPseudo(const char *pseudo, char *adip, size_t adipSize);
+static int findPseudoByIp(const char *adip, char *nom, size_t nomSize);
+static int sendTextToAdip(const char *adip, const char *text);
 static void commandeList(void);
 static void commandeToPseudo(const char *pseudo, const char *message);
 static void commandeAll(const char *message);
@@ -663,7 +688,7 @@ static int Vers(int argc, char **argv){
     return 0;
 }
 
-static int udpSetupSocket(struct sockaddr_in *sockBroadcast){
+static int udpSetupSocket(void){
     int sid;
 
     sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
@@ -671,8 +696,52 @@ static int udpSetupSocket(struct sockaddr_in *sockBroadcast){
     if(creme_enable_broadcast(sid) == -1){ perror("serveur_udp: broadcast"); close(sid); return -1; }
     if(creme_enable_recv_timeout(sid, 1) == -1){ perror("serveur_udp: timeout"); close(sid); return -1; }
     if(creme_bind_any(sid, BEUIP_PORT) == -1){ perror("serveur_udp: bind"); close(sid); return -1; }
-    if(!creme_prepare_ipv4_addr(sockBroadcast, BEUIP_BROADCAST_IP, BEUIP_PORT)){ close(sid); return -1; }
     return sid;
+}
+
+static void sendToIfaBroadcast(int sid, struct ifaddrs *ifa, const char *msg, int len){
+    char host[NI_MAXHOST];
+    struct sockaddr_in dest;
+
+    if(ifa->ifa_broadaddr == NULL) return;
+    if(getnameinfo(ifa->ifa_broadaddr, sizeof(struct sockaddr_in),
+                   host, sizeof(host), NULL, 0, NI_NUMERICHOST) != 0) return;
+    if(strcmp(host, "127.0.0.1") == 0) return;
+    if(!creme_prepare_ipv4_addr(&dest, host, BEUIP_PORT)) return;
+    sendto(sid, msg, len, 0, (struct sockaddr *)&dest, sizeof(dest));
+    #ifdef TRACE
+    printf("[TRACE] broadcast sent to %s\n", host);
+    #endif
+}
+
+static void broadcastToAll(int sid, const char *msg, int len){
+    struct ifaddrs *ifas, *ifa;
+
+    if(getifaddrs(&ifas) != 0){ perror("getifaddrs"); return; }
+    for(ifa = ifas; ifa != NULL; ifa = ifa->ifa_next){
+        if(ifa->ifa_addr == NULL) continue;
+        if(ifa->ifa_addr->sa_family != AF_INET) continue;
+        sendToIfaBroadcast(sid, ifa, msg, len);
+    }
+    freeifaddrs(ifas);
+}
+
+static void sendPresenceAll(int sid, const char *pseudo){
+    char msg[BEUIP_LBUF + 1];
+    int len;
+
+    len = creme_build_message(BEUIP_CODE_BROADCAST, pseudo, msg, sizeof(msg));
+    if(len < 0){ fprintf(stderr, "sendPresenceAll: message too long\n"); return; }
+    broadcastToAll(sid, msg, len);
+}
+
+static void sendLeaveAll(int sid, const char *pseudo){
+    char msg[BEUIP_LBUF + 1];
+    int len;
+
+    len = creme_build_message(BEUIP_CODE_LEAVE, pseudo, msg, sizeof(msg));
+    if(len < 0){ fprintf(stderr, "sendLeaveAll: message too long\n"); return; }
+    broadcastToAll(sid, msg, len);
 }
 
 static int isServerCode(char code){
@@ -680,14 +749,58 @@ static int isServerCode(char code){
            code == BEUIP_CODE_ACK  || code == BEUIP_CODE_TEXT;
 }
 
+static void handleCodeLeave(const char *payload, int payloadLen, const char *remoteAdip){
+    char nom[LPSEUDO + 1];
+
+    if(!creme_copy_payload_string(payload, payloadLen, nom, sizeof(nom))) return;
+    supprimeElt((char *)remoteAdip);
+    printf("[CODE 0] FROM: %s | PSEUDO: %s | EVENT: LEAVE\n", remoteAdip, nom);
+}
+
+static void handleCodeAnnounce(int sid, const char *selfPseudo, char code,
+                                const char *payload, int payloadLen,
+                                const char *remoteAdip,
+                                const struct sockaddr_in *remote, socklen_t ls){
+    char nom[LPSEUDO + 1];
+    char ackMsg[BEUIP_LBUF + 1];
+    int ackLen;
+
+    if(!creme_copy_payload_string(payload, payloadLen, nom, sizeof(nom))) return;
+    ajouteElt(nom, (char *)remoteAdip);
+    printf("[CODE %c] FROM: %s | PSEUDO: %s\n", code, remoteAdip, nom);
+    if(code != BEUIP_CODE_BROADCAST) return;
+    ackLen = creme_build_message(BEUIP_CODE_ACK, selfPseudo, ackMsg, sizeof(ackMsg));
+    if(ackLen > 0) sendto(sid, ackMsg, ackLen, 0, (const struct sockaddr *)remote, ls);
+}
+
+static void handleCodeText(const char *payload, int payloadLen, const char *remoteAdip){
+    char text[BEUIP_LBUF + 1];
+    char nom[LPSEUDO + 1];
+
+    if(!creme_copy_payload_string(payload, payloadLen, text, sizeof(text))) return;
+    if(findPseudoByIp(remoteAdip, nom, sizeof(nom)) == 0)
+        printf("[CODE 9] FROM: %s (%s) | MSG: %s\n", nom, remoteAdip, text);
+    else
+        printf("[CODE 9] FROM: %s | MSG: %s\n", remoteAdip, text);
+}
+
 static void udpHandleDatagram(int sid, const char *pseudo, char *buf, int n,
                                struct sockaddr_in *sockRemote, socklen_t ls){
-    if(!isServerCode(buf[0])){
-        fprintf(stderr, "[SECURITY] Rejected code '%c'\n", buf[0]);
-        return;
-    }
+    char code;
+    const char *payload;
+    int payloadLen;
+    char remoteAdip[16];
+    unsigned int ip;
+
+    if(!isServerCode(buf[0])){ fprintf(stderr, "[SECURITY] Rejected code '%c'\n", buf[0]); return; }
+    if(!creme_parse_header(buf, n, &code, &payload, &payloadLen)) return;
+    ip = ntohl(sockRemote->sin_addr.s_addr);
+    snprintf(remoteAdip, sizeof(remoteAdip), "%u.%u.%u.%u",
+             (ip>>24)&0xFF, (ip>>16)&0xFF, (ip>>8)&0xFF, ip&0xFF);
     pthread_mutex_lock(&g_peers_mutex);
-    creme_handle_server_datagram(sid, pseudo, &g_peers, sockRemote, ls, buf, n);
+    if(code == BEUIP_CODE_LEAVE) handleCodeLeave(payload, payloadLen, remoteAdip);
+    else if(code == BEUIP_CODE_TEXT) handleCodeText(payload, payloadLen, remoteAdip);
+    else handleCodeAnnounce(sid, pseudo, code, payload, payloadLen, remoteAdip, sockRemote, ls);
     pthread_mutex_unlock(&g_peers_mutex);
 }
 
@@ -708,16 +821,15 @@ static void udpRunLoop(int sid, const char *pseudo){
 
 static void *serveur_udp(void *p){
     const char *pseudo = (const char *)p;
-    struct sockaddr_in sockBroadcast;
     int sid;
 
-    creme_init_peer_table(&g_peers);
-    sid = udpSetupSocket(&sockBroadcast);
+    clearList();
+    sid = udpSetupSocket();
     if(sid < 0){ g_beuipRunning = 0; return NULL; }
     printf("[SERVER] BEUIP thread listening on UDP %d | pseudo=%s\n", BEUIP_PORT, pseudo);
-    creme_send_presence(sid, &sockBroadcast, pseudo);
+    sendPresenceAll(sid, pseudo);
     udpRunLoop(sid, pseudo);
-    creme_send_leave(sid, &sockBroadcast, pseudo);
+    sendLeaveAll(sid, pseudo);
     close(sid);
     printf("[SERVER] BEUIP thread stopped\n");
     g_beuipRunning = 0;
@@ -786,17 +898,114 @@ static int stopBeuipServer(void){
     return 0;
 }
 
-static int sendTextToIp(unsigned int ipHost, const char *text){
+static int eltExists(const char *pseudo, const char *adip){
+    struct elt *cur;
+
+    for(cur = g_list; cur != NULL; cur = cur->next){
+        if(strcmp(cur->adip, adip) == 0 && strcmp(cur->nom, pseudo) == 0) return 1;
+    }
+    return 0;
+}
+
+static void insertElt(struct elt *newElt, const char *pseudo){
+    struct elt *cur, *prev;
+
+    prev = NULL;
+    cur = g_list;
+    while(cur != NULL && strcmp(cur->nom, pseudo) < 0){
+        prev = cur;
+        cur = cur->next;
+    }
+    newElt->next = cur;
+    if(prev == NULL) g_list = newElt;
+    else prev->next = newElt;
+}
+
+static void ajouteElt(char *pseudo, char *adip){
+    struct elt *newElt;
+
+    if(eltExists(pseudo, adip)) return;
+    newElt = malloc(sizeof(struct elt));
+    if(newElt == NULL){ perror("ajouteElt"); return; }
+    strncpy(newElt->nom, pseudo, LPSEUDO);
+    newElt->nom[LPSEUDO] = '\0';
+    strncpy(newElt->adip, adip, 15);
+    newElt->adip[15] = '\0';
+    insertElt(newElt, pseudo);
+}
+
+static void supprimeElt(char *adip){
+    struct elt *cur, *prev;
+
+    prev = NULL;
+    cur = g_list;
+    while(cur != NULL && strcmp(cur->adip, adip) != 0){
+        prev = cur;
+        cur = cur->next;
+    }
+    if(cur == NULL) return;
+    if(prev == NULL) g_list = cur->next;
+    else prev->next = cur->next;
+    free(cur);
+}
+
+static void listeElts(void){
+    struct elt *cur;
+    int count;
+
+    count = 0;
+    for(cur = g_list; cur != NULL; cur = cur->next) count++;
+    printf("[LISTE] PEERS: %d\n", count);
+    for(cur = g_list; cur != NULL; cur = cur->next)
+        printf("  %-24s %s\n", cur->nom, cur->adip);
+}
+
+static void clearList(void){
+    struct elt *cur, *next;
+
+    cur = g_list;
+    while(cur != NULL){
+        next = cur->next;
+        free(cur);
+        cur = next;
+    }
+    g_list = NULL;
+}
+
+static int findIpByPseudo(const char *pseudo, char *adip, size_t adipSize){
+    struct elt *cur;
+
+    for(cur = g_list; cur != NULL; cur = cur->next){
+        if(strcmp(cur->nom, pseudo) == 0){
+            strncpy(adip, cur->adip, adipSize - 1);
+            adip[adipSize - 1] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int findPseudoByIp(const char *adip, char *nom, size_t nomSize){
+    struct elt *cur;
+
+    for(cur = g_list; cur != NULL; cur = cur->next){
+        if(strcmp(cur->adip, adip) == 0){
+            strncpy(nom, cur->nom, nomSize - 1);
+            nom[nomSize - 1] = '\0';
+            return 0;
+        }
+    }
+    return -1;
+}
+
+static int sendTextToAdip(const char *adip, const char *text){
     struct sockaddr_in dest;
     char msg[BEUIP_LBUF + 1];
     int sid, len;
 
     sid = socket(AF_INET, SOCK_DGRAM, IPPROTO_UDP);
     if(sid < 0){ perror("commande: socket"); return -1; }
-    memset(&dest, 0, sizeof(dest));
-    dest.sin_family = AF_INET;
-    dest.sin_port = htons(BEUIP_PORT);
-    dest.sin_addr.s_addr = htonl(ipHost);
+    if(!creme_prepare_ipv4_addr(&dest, adip, BEUIP_PORT)){ close(sid); return -1; }
     len = creme_build_message(BEUIP_CODE_TEXT, text, msg, sizeof(msg));
     if(len < 0){ close(sid); return -1; }
     sendto(sid, msg, len, 0, (struct sockaddr *)&dest, sizeof(dest));
@@ -806,31 +1015,39 @@ static int sendTextToIp(unsigned int ipHost, const char *text){
 
 static void commandeList(void){
     pthread_mutex_lock(&g_peers_mutex);
-    creme_print_peer_list(&g_peers);
+    listeElts();
     pthread_mutex_unlock(&g_peers_mutex);
 }
 
 static void commandeToPseudo(const char *pseudo, const char *message){
-    int idx;
-    unsigned int ip;
+    char adip[16];
+    int rc;
 
     pthread_mutex_lock(&g_peers_mutex);
-    idx = creme_find_peer_by_pseudo(&g_peers, pseudo);
-    if(idx >= 0) ip = g_peers.entries[idx].ip;
+    rc = findIpByPseudo(pseudo, adip, sizeof(adip));
     pthread_mutex_unlock(&g_peers_mutex);
-    if(idx < 0){ fprintf(stderr, "mess: pseudo '%s' not found\n", pseudo); return; }
-    sendTextToIp(ip, message);
+    if(rc < 0){ fprintf(stderr, "mess: pseudo '%s' not found\n", pseudo); return; }
+    sendTextToAdip(adip, message);
 }
 
 static void commandeAll(const char *message){
-    unsigned int ips[BEUIP_MAX_PEERS];
-    int i, count;
+    struct elt *cur;
+    char (*ips)[16];
+    int count, i;
 
     pthread_mutex_lock(&g_peers_mutex);
-    count = g_peers.count;
-    for(i = 0; i < count; i++) ips[i] = g_peers.entries[i].ip;
+    count = 0;
+    for(cur = g_list; cur != NULL; cur = cur->next) count++;
+    ips = malloc(count * 16);
+    if(ips != NULL){
+        i = 0;
+        for(cur = g_list; cur != NULL; cur = cur->next)
+            strncpy(ips[i++], cur->adip, 16);
+    }
     pthread_mutex_unlock(&g_peers_mutex);
-    for(i = 0; i < count; i++) sendTextToIp(ips[i], message);
+    if(ips == NULL){ perror("commandeAll"); return; }
+    for(i = 0; i < count; i++) sendTextToAdip(ips[i], message);
+    free(ips);
 }
 
 static void commande(char octet1, char *message, char *pseudo){
