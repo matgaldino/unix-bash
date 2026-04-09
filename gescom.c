@@ -5,7 +5,9 @@
 #include<string.h>
 #include<sys/wait.h>
 #include<signal.h>
+#ifndef NO_READLINE
 #include<readline/history.h>
+#endif
 #include<fcntl.h>
 #include<errno.h>
 #include<pthread.h>
@@ -135,14 +137,10 @@ static void commandeToPseudo(const char *pseudo, const char *message);
 static void commandeAll(const char *message);
 static void commande(char octet1, char *message, char *pseudo);
 static int handleBeuipStop(int argc);
+static int beuipMessageCommand(int argc, char **argv);
 static int validateBeuipStartArgs(int argc, char **argv);
 static int spawnBeuipServer(int argc, char **argv);
 static int stopBeuipServer(void);
-static int Mess(int argc, char **argv);
-static int messUsage(void);
-static int messListCommand(int argc);
-static int messToCommand(int argc, char **argv);
-static int messAllCommand(int argc, char **argv);
 static char *joinArgs(int start, int argc, char **argv);
 static size_t joinedArgsLength(int start, int argc, char **argv);
 static void appendJoinedArgs(char *msg, int start, int argc, char **argv);
@@ -241,7 +239,6 @@ void updateComInt(char *bicepsVersion){
     addCom("pwd", Pwd);
     addCom("vers", Vers);
     addCom("beuip", Beuip);
-    addCom("mess", Mess);
 }
 
 void listComInt(void){
@@ -648,14 +645,18 @@ static void applyRedirections(void){
 
 
 static int Exit(int argc, char **argv){
+#ifndef NO_READLINE
     char *historyPath;
+#endif
     
     (void)argc;
     (void)argv;
 
+#ifndef NO_READLINE
     historyPath = getHistoryPath();
     write_history(historyPath);
     free(historyPath);
+#endif
 
     if(g_beuipRunning){
         stopBeuipServer();
@@ -1155,12 +1156,36 @@ static void demandeFichier(char *pseudo, char *nomfic){
     doGetFile(adip, nomfic);
 }
 
+static int beuipMessageCommand(int argc, char **argv){
+    char *msg;
+
+    if(argc < 4){ fprintf(stderr, "Usage: beuip message <pseudo|all> <message>\n"); return 1; }
+    if(strcmp(argv[2], "all") == 0){
+        msg = joinArgs(3, argc, argv);
+        if(msg == NULL) return 1;
+        commande(BEUIP_CODE_TO_ALL, msg, NULL);
+        free(msg);
+        return 0;
+    }
+    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
+        fprintf(stderr, "beuip: invalid pseudo (1..%d chars)\n", BEUIP_MAX_PSEUDO_LEN - 1);
+        return 1;
+    }
+    msg = joinArgs(3, argc, argv);
+    if(msg == NULL) return 1;
+    commande(BEUIP_CODE_TO_PSEUDO, msg, argv[2]);
+    free(msg);
+    return 0;
+}
+
 static int Beuip(int argc, char **argv){
     if(argc < 2){
-        fprintf(stderr, "Usage: beuip start <pseudo> [reppub] | beuip stop | beuip ls <pseudo> | beuip get <pseudo> <nomfic>\n");
+        fprintf(stderr, "Usage: beuip start <pseudo> [reppub] | beuip stop | beuip list | beuip ls <pseudo> | beuip get <pseudo> <nomfic> | beuip message <pseudo|all> <message>\n");
         return 1;
     }
     if(strcmp(argv[1], "stop") == 0) return handleBeuipStop(argc);
+    if(strcmp(argv[1], "list") == 0){ commandeList(); return 0; }
+    if(strcmp(argv[1], "message") == 0) return beuipMessageCommand(argc, argv);
     if(strcmp(argv[1], "ls") == 0){
         if(argc != 3){ fprintf(stderr, "Usage: beuip ls <pseudo>\n"); return 1; }
         demandeListe(argv[2]);
@@ -1172,7 +1197,7 @@ static int Beuip(int argc, char **argv){
         return 0;
     }
     if(validateBeuipStartArgs(argc, argv) != 0){
-        fprintf(stderr, "Usage: beuip start <pseudo> [reppub] | beuip stop | beuip ls <pseudo> | beuip get <pseudo> <nomfic>\n");
+        fprintf(stderr, "Usage: beuip start <pseudo> [reppub] | beuip stop | beuip list | beuip ls <pseudo> | beuip get <pseudo> <nomfic> | beuip message <pseudo|all> <message>\n");
         return 1;
     }
     return spawnBeuipServer(argc, argv);
@@ -1183,6 +1208,8 @@ static int stopBeuipServer(void){
     g_stopUdp = 1;
     pthread_join(g_beuipThread, NULL);
     pthread_join(g_beuipTcpThread, NULL);
+    clearList();
+    g_beuipRunning = 0;
     printf("beuip: servers stopped\n");
     return 0;
 }
@@ -1240,13 +1267,9 @@ static void supprimeElt(char *adip){
 
 static void listeElts(void){
     struct elt *cur;
-    int count;
 
-    count = 0;
-    for(cur = g_list; cur != NULL; cur = cur->next) count++;
-    printf("[LISTE] PEERS: %d\n", count);
     for(cur = g_list; cur != NULL; cur = cur->next)
-        printf("  %-24s %s\n", cur->nom, cur->adip);
+        printf("%s : %s\n", cur->adip, cur->nom);
 }
 
 static void clearList(void){
@@ -1382,47 +1405,3 @@ static char *joinArgs(int start, int argc, char **argv){
     return msg;
 }
 
-static int messUsage(void){
-    fprintf(stderr, "Usage: mess list | mess to <pseudo> <message> | mess all <message>\n");
-    return 1;
-}
-
-static int messListCommand(int argc){
-    if(argc != 2){ fprintf(stderr, "Usage: mess list\n"); return 1; }
-    commande(BEUIP_CODE_LIST, NULL, NULL);
-    return 0;
-}
-
-static int messToCommand(int argc, char **argv){
-    char *msg;
-
-    if(argc < 4){ fprintf(stderr, "Usage: mess to <pseudo> <message>\n"); return 1; }
-    if(strlen(argv[2]) == 0 || strlen(argv[2]) >= BEUIP_MAX_PSEUDO_LEN){
-        fprintf(stderr, "mess: invalid pseudo (1..%d chars)\n", BEUIP_MAX_PSEUDO_LEN - 1);
-        return 1;
-    }
-    msg = joinArgs(3, argc, argv);
-    if(msg == NULL) return 1;
-    commande(BEUIP_CODE_TO_PSEUDO, msg, argv[2]);
-    free(msg);
-    return 0;
-}
-
-static int messAllCommand(int argc, char **argv){
-    char *msg;
-
-    if(argc < 3){ fprintf(stderr, "Usage: mess all <message>\n"); return 1; }
-    msg = joinArgs(2, argc, argv);
-    if(msg == NULL) return 1;
-    commande(BEUIP_CODE_TO_ALL, msg, NULL);
-    free(msg);
-    return 0;
-}
-
-static int Mess(int argc, char **argv){
-    if(argc < 2) return messUsage();
-    if(strcmp(argv[1], "list") == 0) return messListCommand(argc);
-    if(strcmp(argv[1], "to") == 0) return messToCommand(argc, argv);
-    if(strcmp(argv[1], "all") == 0) return messAllCommand(argc, argv);
-    return messUsage();
-}

@@ -1,5 +1,8 @@
 # UNIX SHELL - biceps
 
+NOM: SISTON GALDINO
+PRENOM: Matheus
+
 `biceps` is a Unix shell written in C for an Operating Systems course with integrated BEUIP network protocol support. It includes:
 - Interactive shell core (`biceps` + `gescom`)
 - Reusable network/BEUIP library (`creme`)
@@ -27,7 +30,7 @@ Key work completed:
 ### Shell (`biceps` / `gescom`)
 - Interactive prompt: `user@machine$` (or `#` for root)
 - Persistent readline history (`~/.biceps_history`)
-- Internal commands: `exit`, `help`, `cd`, `pwd`, `vers`, `beuip`, `mess`
+- Internal commands: `exit`, `help`, `cd`, `pwd`, `vers`, `beuip`
 - External commands via `fork` + `execvp`
 - Sequential commands with `;`
 - Pipelines (`|`) and redirections (`<`, `<<`, `>`, `>>`, `2>`, `2>>`)
@@ -46,12 +49,14 @@ Key work completed:
 - Graceful shutdown sends `code=0`
 
 ### Biceps v2 Internal Network Commands
-- `beuip start <pseudo>`: starts `servbeuip` as child process
-- `beuip stop`: sends `SIGINT` to child server (graceful stop)
-- `exit`: also stops running BEUIP child server automatically
-- `mess list`: asks local BEUIP server to print online pseudos
-- `mess to <pseudo> <message>`: sends private message
-- `mess all <message>`: sends message to all
+- `beuip start <pseudo> [reppub]`: starts UDP + TCP server threads
+- `beuip stop`: graceful stop of BEUIP services
+- `beuip list`: prints online users using linked-list traversal in `IP : pseudo` format
+- `beuip message <pseudo> <message>`: sends private message to one user
+- `beuip message all <message>`: sends broadcast message (code 5)
+- `beuip ls <pseudo>`: lists peer shared directory over TCP
+- `beuip get <pseudo> <nomfic>`: downloads a shared file over TCP
+- `exit`: also stops running BEUIP server automatically
 
 `vers` now prints versions of:
 - `gescom`
@@ -62,7 +67,7 @@ Key work completed:
 - **UDP server replaced by a POSIX thread** (`serveur_udp`): shares memory with the shell process, eliminating the need for self-sent UDP messages and closing the man-in-the-middle vulnerability
 - **Codes 3/4/5 removed from UDP**: handled directly in-process via `commande()` using the shared peer list — security hardening
 - **Mutex-protected peer list**: concurrent access between the UDP thread (writes) and the shell thread (reads) guarded by `pthread_mutex_t`
-- **Automatic broadcast address detection**: `getifaddrs()` + `getnameinfo()` enumerate all active interfaces at startup, replacing the hardcoded `192.168.88.255`
+- **Broadcast address**: defined as `BEUIP_BROADCAST_IP` (`"192.168.88.255"`) in a single `#define` in `creme.h` for easy override; `getifaddrs()` enumerates active interfaces to send presence on each network
 - **Peer list replaced by ordered linked list** (`struct elt`): alphabetically sorted by pseudo, dynamically allocated, replaces the fixed-size `creme_peer_table`
 - **TCP server thread** (`serveur_tcp`): listens on port `9998`, spawns one detached thread per connection
 - **`beuip ls <pseudo>`**: connects via TCP to a peer and retrieves its `reppub/` listing (`ls -l`)
@@ -100,7 +105,7 @@ Payload by code:
 - `biceps.c` (≈40 lines): Main REPL loop, prompt display, interactive session management
 - `gescom.c/h` (≈1300 lines): Command parser, execution engine, all internal command handlers
   - Parses user input into tokens and redirections
-  - Routes to built-in commands (`cd`, `pwd`, `vers`, `beuip`, `mess`) or external executables
+  - Routes to built-in commands (`cd`, `pwd`, `vers`, `beuip`) or external executables
   - Manages pipes and I/O redirections (dup2-based redirection)
   - UDP thread: `serveur_udp`, datagram handlers, presence broadcast via `getifaddrs`
   - TCP thread: `serveur_tcp`, `envoiListe`, `envoiFichier`, per-connection thread dispatch
@@ -153,10 +158,11 @@ sudo apt install libreadline-dev
 
 Common targets:
 ```bash
+make              # build biceps (default target)
 make beuip        # build servbeuip + clibeuip
-make biceps       # build shell (primary deliverable)
+make all          # build biceps + servbeuip + clibeuip
 make biceps-debug # build with -DTRACE and debug symbols
-make biceps-valgrind  # run shell under Valgrind
+make memory-leak  # build biceps-memory-leaks (-g -O0) and run valgrind
 make clean        # remove all build artifacts
 ```
 
@@ -172,10 +178,10 @@ Start shell:
 Inside `biceps`:
 ```text
 vers
-beuip start matheus reppub      # starts UDP + TCP servers
-mess list                        # list online peers
-mess to alice hello alice        # private message
-mess all hello everyone          # broadcast message
+beuip start matheus reppub       # starts UDP + TCP servers
+beuip list                       # list online peers (IP : pseudo)
+beuip message alice hello alice  # private message
+beuip message all hello everyone # broadcast message (octet 5)
 beuip ls alice                   # list alice's shared files
 beuip get alice report.pdf       # download file from alice
 beuip stop                       # graceful shutdown

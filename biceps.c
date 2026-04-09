@@ -1,7 +1,9 @@
 #define _GNU_SOURCE
 #include<stdio.h>
+#ifndef NO_READLINE
 #include<readline/readline.h>
 #include<readline/history.h>
+#endif
 #include<stdlib.h>
 #include<unistd.h>
 #include<signal.h>
@@ -20,19 +22,27 @@ static void getMachineName(char *machine, size_t machineSize);
 static char *createPrompt(const char *user, const char *machine, const char *suffix);
 
 int main(int argc, char *argv[]){    
-    char *prompt, *historyPath;
+    char *prompt;
+#ifndef NO_READLINE
+    char *historyPath;
+#endif
 
     (void)argc;
     (void)argv;
     initShell();
 
+#ifndef NO_READLINE
     historyPath = getHistoryPath();
     stifle_history(HISTORY_SIZE);
     read_history(historyPath);
+#endif
     prompt = buildPrompt();
     runShellLoop(prompt);
+#ifndef NO_READLINE
     write_history(historyPath);
+    clear_history();
     free(historyPath);
+#endif
     free(prompt);
     return 0;
 }
@@ -43,6 +53,11 @@ static void initShell(void){
     listComInt();
 }
 
+#ifdef NO_READLINE
+static void maybeAddHistory(const char *line){
+    (void)line;
+}
+#else
 static void maybeAddHistory(const char *line){
     HIST_ENTRY *last;
 
@@ -51,7 +66,35 @@ static void maybeAddHistory(const char *line){
         add_history(line);
     }
 }
+#endif
 
+#ifdef NO_READLINE
+static void runShellLoop(const char *prompt){
+    char *line;
+    size_t cap;
+    ssize_t n;
+
+    line = NULL;
+    cap = 0;
+    while(1){
+        printf("%s", prompt);
+        fflush(stdout);
+        n = getline(&line, &cap, stdin);
+        if(n < 0){
+            printf("Exiting biceps shell. Goodbye!\n");
+            break;
+        }
+        if(n > 0 && line[n - 1] == '\n'){
+            line[n - 1] = '\0';
+        }
+        if(*line != '\0'){
+            maybeAddHistory(line);
+            execLine(line);
+        }
+    }
+    free(line);
+}
+#else
 static void runShellLoop(const char *prompt){
     char *line;
 
@@ -68,6 +111,7 @@ static void runShellLoop(const char *prompt){
         free(line);
     }
 }
+#endif
 
 static const char *getUserName(void){
     const char *user;
@@ -112,9 +156,17 @@ static char *buildPrompt(void){
     return createPrompt(user, machine, suffix);
 }
 
+#ifdef NO_READLINE
+static void intHandler(int s){
+    (void)s;
+    printf("\n");
+    fflush(stdout);
+}
+#else
 static void intHandler(int s){
     (void)s;
     printf("\n");
     rl_on_new_line();
     rl_redisplay();
 }
+#endif

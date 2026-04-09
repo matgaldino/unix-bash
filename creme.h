@@ -19,7 +19,9 @@
 #define BEUIP_CODE_TO_ALL '5'
 #define BEUIP_CODE_LEAVE '0'
 #define BEUIP_CODE_TEXT '9'
+#ifndef BEUIP_BROADCAST_IP
 #define BEUIP_BROADCAST_IP "192.168.88.255"
+#endif
 
 typedef struct {
     unsigned int ip;
